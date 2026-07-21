@@ -15,6 +15,8 @@ RHC coverage is **bundled into every tier at no extra cost**. Get a free API key
 
 > **Key-mode only.** Authenticate with an `msk_` Bearer API key (`MADEONSOL_API_KEY`). The x402 pay-per-call rail is Solana-native and is not part of this server.
 
+New customers get a **5-day free trial** of Pro or Ultra when you pay by card — full access, nothing charged during the trial, cancel anytime. Start at [madeonsol.com/pricing](https://madeonsol.com/pricing).
+
 ## Install & configure
 
 Add to your MCP client config (Claude Desktop, Cursor, Claude Code). No install step — `npx` fetches it on first run:
