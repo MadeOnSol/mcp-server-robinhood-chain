@@ -1,0 +1,55 @@
+{
+  "name": "mcp-server-robinhood-chain",
+  "maintainers": [
+    "madeonsol"
+  ],
+  "display_name": "Robinhood Chain — EVM-native trading intelligence",
+  "description": "Robinhood Chain (chain id 4663) on-chain trading intelligence for AI agents — real-time KOL trades from tracked wallets' verified EVM addresses, the full Uniswap v2/v3/v4 DEX trade tape, token discovery with launch-bundle + early-buyer-quality detection, 1-minute OHLC candles, deployer reputation (graduation_rate / runner_rate over 40k+ deployers), and smart-money wallet ranking. EVM-native throughout (0x addresses, eth_amount, tx_hash, net_flow_eth) from our self-hosted RHC node. Free tier 200 requests/day; auth via msk_ API key, bundled into every tier at no extra cost.",
+  "version": "0.1.0",
+  "homepage": "https://madeonsol.com/robinhood",
+  "repository": "https://github.com/madeonsol/mcp-server-robinhood-chain",
+  "license": "MIT",
+  "categories": [
+    "blockchain",
+    "finance",
+    "web3"
+  ],
+  "tags": [
+    "mcp",
+    "claude",
+    "cursor",
+    "robinhood-chain",
+    "rhc",
+    "evm",
+    "arbitrum-orbit",
+    "chain-4663",
+    "kol",
+    "kol-tracker",
+    "deployer-hunter",
+    "smart-money",
+    "memecoin",
+    "trading",
+    "api"
+  ],
+  "tools": [
+    { "name": "rhc_kol_feed", "description": "Real-time Robinhood Chain KOL trade feed — EVM-native (0x, eth_amount, tx_hash)." },
+    { "name": "rhc_kol_leaderboard", "description": "RHC KOLs ranked by trade count then net ETH flow (24h/7d/30d)." },
+    { "name": "rhc_kol_hot_tokens", "description": "RHC consensus tokens — bought by 2+ distinct KOLs in the window." },
+    { "name": "rhc_kol_profile", "description": "Single RHC KOL profile — stats over last 200 trades + 50 recent." },
+    { "name": "rhc_trades", "description": "RHC DEX trade tape — Uniswap v2/v3/v4 swaps with trader_eoa + MEV fields. PRO+." },
+    { "name": "rhc_tokens", "description": "RHC token discovery — MC, liquidity, peak MC, launchpad, deployer tier. PRO+." },
+    { "name": "rhc_token", "description": "RHC token snapshot — price/MC/FDV, deployer block, KOL activity, pools." },
+    { "name": "rhc_token_candles", "description": "RHC 1-minute OHLC candles — price + MC OHLC, volume buy/sell split. PRO+." },
+    { "name": "rhc_token_kol_consensus", "description": "RHC KOL consensus on a token — buyers/sellers, exit rate, net_flow_eth. PRO+." },
+    { "name": "rhc_token_buyer_quality", "description": "RHC 0–100 early-buyer quality with bundle + dump-cluster legs." },
+    { "name": "rhc_token_bundle", "description": "RHC launch-bundle detection (same_block) + how much the cohort still holds." },
+    { "name": "rhc_deployer_leaderboard", "description": "RHC deployers ranked by reputation — graduation_rate ($40K), runner_rate ($100K)." },
+    { "name": "rhc_deployer_profile", "description": "Single RHC deployer profile + 50 most recent tokens." },
+    { "name": "rhc_alpha_wallets", "description": "RHC smart-money wallets — net_eth, win_rate, memecoin_share, likely_bot. PRO+." }
+  ],
+  "transports": [
+    "stdio",
+    "http"
+  ],
+  "runtime": "node"
+}

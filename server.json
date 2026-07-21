@@ -1,0 +1,20 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.MadeOnSol/robinhood-chain",
+  "description": "Robinhood Chain (chain id 4663) EVM-native on-chain trading intelligence — KOL trades, DEX tape, token/bundle/candle intel, deployer reputation, smart-money wallets. Auth via msk_ API key.",
+  "repository": {
+    "url": "https://github.com/madeonsol/mcp-server-robinhood-chain.git",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "mcp-server-robinhood-chain",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
