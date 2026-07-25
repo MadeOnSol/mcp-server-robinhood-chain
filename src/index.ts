@@ -8,8 +8,8 @@
  *
  * Key-mode only: authenticate with an `msk_` Bearer API key (get a free key at
  * https://madeonsol.com/pricing — RHC coverage is bundled into every tier). The
- * x402 pay-per-call rail is Solana-native and is not part of this server. All 14
- * tools map 1:1 to GET /api/v1/rhc/… routes.
+ * x402 pay-per-call rail is live on Robinhood Chain too (6 keyless endpoints, discovery at /api/x402/rhc), but is not part of this server. All 25
+ * tools map 1:1 to /api/v1/rhc/… routes (GET, plus two POST batch routes).
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -82,6 +82,28 @@ async function query(path: string, params?: Record<string, string | number>): Pr
   return JSON.stringify(await res.json(), null, 2);
 }
 
+/**
+ * Perform a POST against a Robinhood Chain batch route. Same auth + error
+ * contract as `query` — these routes are POST only because the address list is
+ * too large for a query string, not because they mutate anything.
+ */
+async function post(path: string, body: unknown): Promise<string> {
+  if (authMode !== "madeonsol") {
+    return "Robinhood Chain tools require MADEONSOL_API_KEY (msk_) — get one free at https://madeonsol.com/pricing (RHC is bundled into every tier).";
+  }
+  const url = new URL(path, BASE_URL);
+  const res = await fetch(url.toString(), {
+    method: "POST",
+    headers: { ...apiKeyHeaders(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return `Error ${res.status}: ${text}`;
+  }
+  return JSON.stringify(await res.json(), null, 2);
+}
+
 const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true };
 
 function registerTools(server: McpServer) {
@@ -145,6 +167,52 @@ function registerTools(server: McpServer) {
     })
   );
 
+  server.tool(
+    "rhc_kol_coordination",
+    "Robinhood Chain KOL coordination / clustering — tokens bought by min_kols+ DISTINCT tracked KOLs inside the window, ranked by KOL count then buy ETH. Per token: buy/sell/net ETH, signal ('accumulating' when net_eth >= 0, else 'distributing'), exited_count vs holders_count, time_to_consensus_sec (first→last KOL buy), MC at first KOL buy, current/peak MC, liquidity, deployer_tier, token age, and the per-KOL breakdown (evm_address, name, twitter_url, buy_eth, sell_eth, exited). Computed read-time from the RHC KOL tape — RHC has no KOL winrate/strategy scores, so those Solana fields are absent. Tier: BASIC.",
+    {
+      period: z.enum(["1h", "6h", "24h", "7d"]).default("24h").describe("Rolling window over KOL buys"),
+      min_kols: z.number().min(2).max(50).default(2).describe("Minimum distinct KOL buyers for a token to qualify (2-50)"),
+      limit: z.number().min(1).max(50).default(20).describe("Number of tokens to return (1-50)"),
+      min_mc_usd: z.number().min(0).optional().describe("Minimum market cap at the FIRST KOL buy (tokens with unknown MC are dropped when a band is set)"),
+      max_mc_usd: z.number().min(0).optional().describe("Maximum market cap at the first KOL buy — must be >= min_mc_usd"),
+    },
+    readOnly,
+    async ({ period, min_kols, limit, min_mc_usd, max_mc_usd }) => {
+      const params: Record<string, string | number> = { period, min_kols, limit };
+      if (min_mc_usd !== undefined) params.min_mc_usd = min_mc_usd;
+      if (max_mc_usd !== undefined) params.max_mc_usd = max_mc_usd;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/kol/coordination", params) }] };
+    }
+  );
+
+  server.tool(
+    "rhc_kol_first_touches",
+    "Robinhood Chain KOL first touches — the GLOBALLY earliest buy by ANY tracked KOL per token (the discovery / early-entry signal), newest first. Each event carries eth_amount, tx_hash, token_age_minutes at the touch, MC + price at the first buy, current and peak MC, and the first_kol block. Cursor back with next_before. Tier: BASIC, but limit is clamped to 20 below PRO and the KOL's evm_address is returned only on ULTRA/BUSINESS (name + twitter_url always).",
+    {
+      limit: z.number().min(1).max(100).default(50).describe("Number of events (1-100; clamped to 20 on BASIC)"),
+      since: z.string().optional().describe("Only first touches strictly newer than this (ISO 8601 with offset)"),
+      before: z.string().optional().describe("Cursor — only first touches strictly older than this (ISO 8601 with offset). Pass next_before to page back."),
+      min_eth: z.number().min(0).max(100000).optional().describe("Minimum size of the first buy in ETH"),
+      token_age_max_min: z.number().min(1).max(43200).optional().describe("Only tokens younger than N minutes at the time of the first touch"),
+      launchpad: z.string().optional().describe("Filter by launchpad: pons, flap, clanker, hood.fun, noxa, virtuals"),
+      min_mc_usd: z.number().min(0).optional().describe("Minimum market cap at the first buy"),
+      max_mc_usd: z.number().min(0).optional().describe("Maximum market cap at the first buy — must be >= min_mc_usd"),
+    },
+    readOnly,
+    async ({ limit, since, before, min_eth, token_age_max_min, launchpad, min_mc_usd, max_mc_usd }) => {
+      const params: Record<string, string | number> = { limit };
+      if (since) params.since = since;
+      if (before) params.before = before;
+      if (min_eth !== undefined) params.min_eth = min_eth;
+      if (token_age_max_min !== undefined) params.token_age_max_min = token_age_max_min;
+      if (launchpad) params.launchpad = launchpad;
+      if (min_mc_usd !== undefined) params.min_mc_usd = min_mc_usd;
+      if (max_mc_usd !== undefined) params.max_mc_usd = max_mc_usd;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/kol/first-touches", params) }] };
+    }
+  );
+
   /* ── DEX trade tape ── */
 
   server.tool(
@@ -206,6 +274,18 @@ function registerTools(server: McpServer) {
   );
 
   server.tool(
+    "rhc_token_batch",
+    "Robinhood Chain multi-token snapshot — up to 50 tokens in ONE call (POST /api/v1/rhc/token/batch). Per token: symbol/name/decimals, launchpad, graduation status, live price/MC/FDV/liquidity, peak MC + peak_mc_at, primary_dex, last trade time, and the deployer reputation block (tier, tokens_deployed, graduation_rate, runner_rate). Set-based, so it is far cheaper than 50 single-token calls. Every REQUESTED address is echoed back in order — unknown ones come back as found:false rather than being silently dropped. Deliberately does NOT include buyer-quality (use rhc_token_batch_buyer_quality). Tier: BASIC.",
+    {
+      addresses: z.array(z.string()).min(1).max(50).describe("1-50 token addresses (0x, 40 hex). Duplicates are de-duplicated; addresses are lowercased."),
+    },
+    readOnly,
+    async ({ addresses }) => ({
+      content: [{ type: "text" as const, text: await post("/api/v1/rhc/token/batch", { addresses }) }],
+    })
+  );
+
+  server.tool(
     "rhc_token_candles",
     "Robinhood Chain 1-minute OHLC candles — price + market-cap OHLC, close liquidity, volume with buy/sell split, and trade/buy/sell counts, ordered oldest→newest. Tier: PRO+.",
     {
@@ -248,6 +328,18 @@ function registerTools(server: McpServer) {
   );
 
   server.tool(
+    "rhc_token_batch_buyer_quality",
+    "Robinhood Chain multi-token early-buyer quality — score several tokens' early-buyer cohorts in ONE call (POST /api/v1/rhc/tokens/batch/buyer-quality). MAX 20 ADDRESSES, not the Solana batch cap of 50: RHC buyer-quality is a per-token cohort computation (ordered early-buyer scan + bundle + alpha/dump-cluster joins), so it cannot collapse into one set-based query. Each entry is the same payload rhc_token_buyer_quality returns; a token that fails to score degrades to an { error } entry instead of failing the whole batch, and the response reports requested vs scored. Tier: BASIC.",
+    {
+      addresses: z.array(z.string()).min(1).max(20).describe("1-20 token addresses (0x, 40 hex) — the cap is 20, NOT 50. Duplicates are de-duplicated."),
+    },
+    readOnly,
+    async ({ addresses }) => ({
+      content: [{ type: "text" as const, text: await post("/api/v1/rhc/tokens/batch/buyer-quality", { addresses }) }],
+    })
+  );
+
+  server.tool(
     "rhc_token_bundle",
     "Robinhood Chain launch-bundle detection — ranks the first 20 distinct buyers by on-chain order and flags a bundle when 3+ make their first buy in the SAME BLOCK (bundle_kind 'same_block'; there is no atomic_tx on an Arbitrum Orbit L2), then reports the cohort's current held %. Field-gated by tier: BASIC gets the scalar bundle signal; PRO adds the top-10 wallets; ULTRA returns the full cohort with alpha-wallet identity. Tier: BASIC.",
     {
@@ -263,7 +355,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_deployer_leaderboard",
-    "Robinhood Chain deployer reputation leaderboard — deployers ranked by reputation over every launchpad token we've indexed (40k+ deployers). Most RHC launchpads are direct-to-DEX (no bonding curve), so graduation is a market-cap milestone: graduation_rate = share of tokens that reached a $40K+ peak MC; runner_rate = share that reached $100K+. Tier: BASIC.",
+    "Robinhood Chain deployer reputation leaderboard — deployers ranked by reputation over every launchpad token we've indexed (99k+ deployers). Most RHC launchpads are direct-to-DEX (no bonding curve), so both milestones are market-cap based: graduation_rate = share of tokens that reached a $40K+ peak MC; runner_rate = share that reached $100K+. IMPORTANT (migrations 267 + 269): the elite/good TIER now rides runner_rate ($100K) AND requires 24h of deployer history — elite = 5+ tokens, 24h+ old, runner_rate >= 0.50; good = same with >= 0.25. graduation_rate still means the $40K bar and is still returned, but it NO LONGER sets the tier (it proved farmable by operators rotating wallets); only the spammer label still keys off it (20+ tokens, graduation_rate < 0.05). Tier: BASIC.",
     {
       sort: z.enum(["graduation_rate", "runner_rate", "tokens_deployed", "best_peak_mc_usd", "last_deploy_at"]).optional().describe("Ordering (all descending, NULLs last; default graduation_rate)"),
       tier: z.enum(["elite", "good", "neutral", "spammer"]).optional().describe("Filter to one reputation tier"),
@@ -284,7 +376,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_deployer_profile",
-    "Robinhood Chain single deployer profile — one deployer's full reputation row (tier, bonding_rate, runner_rate, best peak MC, launchpads, deploy timeline) plus their 50 most recent tokens enriched with live MC and peak MC. Unknown wallets return 200 with is_deployer: false (not a 404). Tier: BASIC.",
+    "Robinhood Chain single deployer profile — one deployer's full reputation row (tier, bonding_rate, runner_rate, best peak MC, launchpads, deploy timeline) plus their 50 most recent tokens enriched with live MC and peak MC. tier is earned on runner_rate ($100K peak MC) plus 24h of deployer history, NOT on graduation_rate ($40K), which is still returned but no longer sets the tier. Unknown wallets return 200 with is_deployer: false (not a 404). Tier: BASIC.",
     {
       address: z.string().describe("Deployer EVM wallet address (0x, 40 hex)"),
     },
@@ -292,6 +384,123 @@ function registerTools(server: McpServer) {
     async ({ address }) => ({
       content: [{ type: "text" as const, text: await query(`/api/v1/rhc/deployer-hunter/${encodeURIComponent(address)}`) }],
     })
+  );
+
+  server.tool(
+    "rhc_deployer_tokens",
+    "Robinhood Chain deployer launch history (paginated) — the FULL enumerable token list for one deployer, enriched with live MC, peak MC + peak_mc_at and liquidity. Distinct from rhc_deployer_profile, which caps recent tokens at 50 and is a profile read. total is the deployer's lifetime tokens_deployed, with has_more for paging. NOTE: sort=peak_mc_usd re-orders the REQUESTED PAGE only (peak MC lives in another table) and the response echoes sort_scope:'page' to say so — it is not a global top-tokens ranking. Unknown wallets return 200 with is_deployer: false. Tier: BASIC.",
+    {
+      address: z.string().describe("Deployer EVM wallet address (0x, 40 hex)"),
+      limit: z.number().min(1).max(100).default(50).describe("Page size (1-100, default 50)"),
+      offset: z.number().min(0).max(10000).optional().describe("Pagination offset"),
+      sort: z.enum(["first_seen_at", "peak_mc_usd"]).optional().describe("first_seen_at (default, newest first, applied in Postgres) or peak_mc_usd (page-scoped re-sort)"),
+    },
+    readOnly,
+    async ({ address, limit, offset, sort }) => {
+      const params: Record<string, string | number> = { limit };
+      if (offset !== undefined) params.offset = offset;
+      if (sort) params.sort = sort;
+      return { content: [{ type: "text" as const, text: await query(`/api/v1/rhc/deployer-hunter/${encodeURIComponent(address)}/tokens`, params) }] };
+    }
+  );
+
+  server.tool(
+    "rhc_deployer_history",
+    "Robinhood Chain deployer deploy history (deep pagination, up to 1000 per page) — the reputation row plus every token the deployer launched, newest first, enriched with live and peak MC, with an EXACT total count. RHC has no per-day reputation snapshot table, so this is a token-deploy history, not a daily tier time-series. Unknown wallets return 200 with is_deployer: false. Tier: PRO+ (the point-in-time rhc_deployer_profile stays BASIC).",
+    {
+      address: z.string().describe("Deployer EVM wallet address (0x, 40 hex)"),
+      limit: z.number().min(1).max(1000).default(100).describe("Page size (1-1000, default 100)"),
+      offset: z.number().min(0).max(100000).optional().describe("Pagination offset"),
+    },
+    readOnly,
+    async ({ address, limit, offset }) => {
+      const params: Record<string, string | number> = { limit };
+      if (offset !== undefined) params.offset = offset;
+      return { content: [{ type: "text" as const, text: await query(`/api/v1/rhc/deployer-hunter/${encodeURIComponent(address)}/history`, params) }] };
+    }
+  );
+
+  server.tool(
+    "rhc_deployer_trajectory",
+    "Robinhood Chain deployer trajectory — is this deployer getting BETTER or WORSE over time? Returns trend ('improving' | 'declining' | 'stable'), current streak, longest hit/miss streaks, a 10-launch rolling success-rate curve, avg days between deploys, avg launches burned recovering from a miss, and best/worst stretches. The per-token success event is GRADUATION ($40K+ peak MC, echoed as success_metric) — deliberately not the $100K runner bar that sets the tier, because $100K is too rare to give most deployers a readable curve. Field names keep the Solana 'bond' wording for drop-in compatibility. Analyses up to 500 tokens; truncated:true means the curve is a partial history. Unknown wallets return 200 with is_deployer: false. Tier: BASIC.",
+    {
+      address: z.string().describe("Deployer EVM wallet address (0x, 40 hex)"),
+    },
+    readOnly,
+    async ({ address }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/deployer-hunter/${encodeURIComponent(address)}/trajectory`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_deployer_best_tokens",
+    "Robinhood Chain best tokens from REPUTABLE deployers — the highest peak-MC tokens launched by elite/good-tier deployers in the window, each with live MC, peak MC + peak_mc_at, liquidity and the deployer's tier / graduation_rate / runner_rate. Tier-gated on purpose: this answers 'what did the deployers worth tracking actually produce' — for an unfiltered peak-MC ranking use rhc_tokens. Scans at most the 1000 most recent qualifying launches; truncated:true means the top-N was drawn from those rather than the whole period. Tier: BASIC.",
+    {
+      period: z.enum(["24h", "7d", "30d", "all"]).default("7d").describe("Window over the token's first_seen_at (default 7d)"),
+      limit: z.number().min(1).max(50).default(10).describe("Number of tokens (1-50, default 10)"),
+    },
+    readOnly,
+    async ({ period, limit }) => ({
+      content: [{ type: "text" as const, text: await query("/api/v1/rhc/deployer-hunter/best-tokens", { period, limit }) }],
+    })
+  );
+
+  server.tool(
+    "rhc_deployer_stats",
+    "Robinhood Chain chain-wide deployer reputation summary — total deployers and tokens, reputable (elite+good) count, population and token count per tier, spam token share, and 24h/7d alert volume. Also returns the ACTIVE tier_rules so a consumer can read what 'elite' currently means instead of guessing: elite/good are earned on runner_rate ($100K+ peak MC, migration 267) plus 24h of deployer history (migration 269); graduation_rate ($40K) no longer sets the quality tier and only still drives the spammer label. graduation_definition and runner_definition are echoed too. Tier: BASIC.",
+    {},
+    readOnly,
+    async () => ({
+      content: [{ type: "text" as const, text: await query("/api/v1/rhc/deployer-hunter/stats") }],
+    })
+  );
+
+  server.tool(
+    "rhc_deployer_alerts",
+    "Robinhood Chain deployer alert feed — new_deploy / graduated events, newest first. TWO things a consumer must know: (1) TRADABILITY IS FILTERED BY DEFAULT — alerts on tokens with liquidity_usd < $100 (including unknown liquidity) are dropped, because a $45K-MC alert on a drained $68 pool is not a signal; set include_untradeable=true for the raw tape. The active setting is echoed as tradability_filter. (2) TIER IS RESOLVED AT READ TIME from the live reputation view, so it can never advertise a reputation the deployer has since lost; the snapshot written when the alert fired is returned as tier_at_alert with tier_is_stale flagging a drift. Tiers ride runner_rate ($100K peak MC) + 24h of deployer history, not the $40K graduation rate. Each alert also carries liquidity_usd and current_mc_usd. Poll forward with since=next_event_at, page back with before=next_before. Tier: BASIC (limit capped at 50 below ULTRA).",
+    {
+      limit: z.number().min(1).max(500).default(50).describe("Number of alerts (1-500; capped at 50 unless ULTRA)"),
+      deployer_tier: z.enum(["elite", "good", "neutral", "spammer"]).optional().describe("Filter on the RESOLVED (current) tier, applied after read-time resolution"),
+      priority: z.enum(["high", "medium"]).optional().describe("Alert priority (RHC has no 'low')"),
+      alert_type: z.enum(["new_deploy", "graduated"]).optional().describe("Event type — RHC has no bonded/kol_buy alerts"),
+      launchpad: z.string().optional().describe("Filter by launchpad: pons, flap, clanker, hood.fun, noxa, virtuals"),
+      min_mc: z.number().min(0).optional().describe("Minimum market cap at the time the alert fired (mc_at_alert)"),
+      include_untradeable: z.boolean().optional().describe("true disables the default liquidity_usd >= $100 tradability filter and returns the raw tape"),
+      since: z.string().optional().describe("Only alerts with event_at strictly newer than this (ISO 8601 with offset) — the incremental-polling cursor"),
+      before: z.string().optional().describe("Only alerts with event_at strictly older than this (ISO 8601 with offset) — pass next_before to page back"),
+      offset: z.number().min(0).max(10000).optional().describe("Pagination offset (used only when no before cursor is given)"),
+    },
+    readOnly,
+    async ({ limit, deployer_tier, priority, alert_type, launchpad, min_mc, include_untradeable, since, before, offset }) => {
+      const params: Record<string, string | number> = { limit };
+      if (deployer_tier) params.deployer_tier = deployer_tier;
+      if (priority) params.priority = priority;
+      if (alert_type) params.alert_type = alert_type;
+      if (launchpad) params.launchpad = launchpad;
+      if (min_mc !== undefined) params.min_mc = min_mc;
+      if (include_untradeable) params.include_untradeable = "true";
+      if (since) params.since = since;
+      if (before) params.before = before;
+      if (offset !== undefined) params.offset = offset;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/deployer-hunter/alerts", params) }] };
+    }
+  );
+
+  server.tool(
+    "rhc_recent_bonds",
+    "Robinhood Chain recent graduations — tokens that just crossed the $40K peak-MC milestone, newest peak first, with live MC, peak MC + peak_mc_at, launchpad and the deployer's address + tier. On RHC a 'bond' is NOT a bonding-curve completion (noxa/pons/clanker launch direct-to-DEX with no curve); the set is defined purely by peak_mc_usd >= $40,000, echoed as graduation_mc. min_peak can only RAISE that floor, never lower it. Tier: BASIC.",
+    {
+      limit: z.number().min(1).max(200).default(50).describe("Number of tokens (1-200, default 50)"),
+      deployer_tier: z.enum(["elite", "good", "neutral", "spammer"]).optional().describe("Only graduations from deployers in this reputation tier"),
+      min_peak: z.number().min(0).optional().describe("Minimum peak MC in USD — clamped up to $40,000 if lower"),
+    },
+    readOnly,
+    async ({ limit, deployer_tier, min_peak }) => {
+      const params: Record<string, string | number> = { limit };
+      if (deployer_tier) params.deployer_tier = deployer_tier;
+      if (min_peak !== undefined) params.min_peak = min_peak;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/deployer-hunter/recent-bonds", params) }] };
+    }
   );
 
   /* ── Smart money ── */
@@ -333,15 +542,26 @@ const TOOL_CARDS = [
   { name: "rhc_kol_leaderboard", description: "RHC KOLs ranked by trade count then net ETH flow (24h/7d/30d)." },
   { name: "rhc_kol_hot_tokens", description: "RHC consensus tokens — bought by 2+ distinct KOLs in the window." },
   { name: "rhc_kol_profile", description: "Single RHC KOL profile — stats over last 200 trades + 50 recent." },
+  { name: "rhc_kol_coordination", description: "RHC tokens bought by N+ distinct KOLs — net ETH, accumulating vs distributing." },
+  { name: "rhc_kol_first_touches", description: "RHC earliest KOL buy per token — the discovery signal, with MC at entry." },
   { name: "rhc_trades", description: "RHC DEX trade tape — Uniswap v2/v3/v4 swaps with trader_eoa + MEV fields. PRO+." },
   { name: "rhc_tokens", description: "RHC token discovery — MC, liquidity, peak MC, launchpad, deployer tier. PRO+." },
   { name: "rhc_token", description: "RHC token snapshot — price/MC/FDV, deployer block, KOL activity, pools." },
+  { name: "rhc_token_batch", description: "Up to 50 RHC tokens in one call — price/MC/FDV, peak MC, deployer reputation." },
   { name: "rhc_token_candles", description: "RHC 1-minute OHLC candles — price + MC OHLC, volume buy/sell split. PRO+." },
   { name: "rhc_token_kol_consensus", description: "RHC KOL consensus on a token — buyers/sellers, exit rate, net_flow_eth. PRO+." },
   { name: "rhc_token_buyer_quality", description: "RHC 0–100 early-buyer quality with bundle + dump-cluster legs." },
+  { name: "rhc_token_batch_buyer_quality", description: "Early-buyer quality for up to 20 RHC tokens in one call (cap is 20, not 50)." },
   { name: "rhc_token_bundle", description: "RHC launch-bundle detection (same_block) + how much the cohort still holds." },
-  { name: "rhc_deployer_leaderboard", description: "RHC deployers ranked by reputation — graduation_rate ($40K), runner_rate ($100K)." },
+  { name: "rhc_deployer_leaderboard", description: "RHC deployers ranked by reputation — tier rides runner_rate ($100K) + 24h history." },
   { name: "rhc_deployer_profile", description: "Single RHC deployer profile + 50 most recent tokens." },
+  { name: "rhc_deployer_tokens", description: "Paginated RHC deployer launch history with live + peak MC." },
+  { name: "rhc_deployer_history", description: "Deep-paginated RHC deployer deploy history with exact total. PRO+." },
+  { name: "rhc_deployer_trajectory", description: "Is an RHC deployer improving or declining — streaks + rolling success curve." },
+  { name: "rhc_deployer_best_tokens", description: "Highest peak-MC RHC tokens launched by elite/good deployers in a window." },
+  { name: "rhc_deployer_stats", description: "RHC chain-wide deployer summary — tier populations, spam share, active tier rules." },
+  { name: "rhc_deployer_alerts", description: "RHC deployer alerts — tradability-filtered by default, tier resolved at read time." },
+  { name: "rhc_recent_bonds", description: "RHC tokens that just crossed the $40K peak-MC graduation milestone." },
   { name: "rhc_alpha_wallets", description: "RHC smart-money wallets — net_eth, win_rate, memecoin_share, likely_bot. PRO+." },
 ];
 
