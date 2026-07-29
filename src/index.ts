@@ -64,7 +64,13 @@ function initAuth() {
  * path (params already interpolated). Returns the pretty-printed JSON body, or a
  * human-readable error string the model can relay.
  */
-async function query(path: string, params?: Record<string, string | number>): Promise<string> {
+// Values may be undefined: callers pass optional tool args straight through and
+// the loop below already skips them. The type now says so instead of forcing
+// every call site to pre-filter.
+async function query(
+  path: string,
+  params?: Record<string, string | number | undefined>
+): Promise<string> {
   if (authMode !== "madeonsol") {
     return "Robinhood Chain tools require MADEONSOL_API_KEY (msk_) — get one free at https://madeonsol.com/pricing (RHC is bundled into every tier).";
   }
@@ -351,6 +357,73 @@ function registerTools(server: McpServer) {
     })
   );
 
+  server.tool(
+    "rhc_token_top_traders",
+    "Top traders of one Robinhood Chain token, ranked by REALIZED ETH flow, enriched with wallet reputation (win_rate, likely_bot, is_known_kol, kol_name), dump-cluster membership and early-buyer rank. CRITICAL: net_eth is sell_eth MINUS buy_eth — realized flow, NOT PnL. It does not value a trader's remaining bag, so a wallet that bought and still holds ranks LAST, not first. Do not present net_eth as profit. For FIFO cost-basis PnL use the wallet PnL endpoint instead. Tier: PRO+ (50 rows; ULTRA/BUSINESS raises the cap to 200).",
+    {
+      address: z.string().describe("Token address (0x, 40 hex)"),
+      limit: z.number().int().min(1).max(200).optional().describe("Rows (capped 50 on PRO, 200 on ULTRA/BUSINESS)"),
+      offset: z.number().int().min(0).max(10000).optional().describe("Page offset"),
+    },
+    readOnly,
+    async ({ address, limit, offset }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/top-traders`, { limit, offset }) }],
+    })
+  );
+
+  server.tool(
+    "rhc_token_flow",
+    "Net buy/sell flow on a Robinhood Chain token split by mutually-exclusive trader cohort — who is accumulating and who is distributing. SIGN CONVENTION: net_eth = sell MINUS buy, so a POSITIVE net_eth means that cohort DISTRIBUTED (took ETH out) and a NEGATIVE value means it ACCUMULATED. Do not invert this. Cohorts are assigned by a priority ladder and each trader lands in exactly one: kol, bot, dump_cluster, early_buyer, unprofiled, smart_money, retail. smart_money is DERIVED (win_rate >= 0.5 and net positive), not a stored label. unprofiled is a real answer, not missing data — that trader has not met the reputation thresholds yet. There is deliberately NO fresh_wallet cohort because Robinhood Chain stores no wallet-level first-seen. Tier: PRO+.",
+    {
+      address: z.string().describe("Token address (0x, 40 hex)"),
+      window: z.enum(["1h", "6h", "24h", "7d"]).optional().describe("Lookback window (default 24h)"),
+    },
+    readOnly,
+    async ({ address, window }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/flow`, { window }) }],
+    })
+  );
+
+  server.tool(
+    "rhc_token_peak_history",
+    "Peak market cap, drawdown from peak, and a running high-water MC curve for a Robinhood Chain token. IMPORTANT: TWO peaks are returned because they disagree. peak_mc_usd_recorded is the stored high-water mark that every other RHC surface keys off (deployer runner-rate, the $40K graduation bar); it is sampled from write batches so it can UNDERCOUNT an intra-batch spike. peak_mc_usd_observed is the maximum of 1-minute candle highs — trade-level truth, and always >= recorded. Report whichever the user needs but do not treat them as interchangeable. Candle history begins 2026-07-15, so check observed_covers_full_history before calling the observed value a lifetime maximum. running_peak_mc in the curve is monotonically non-decreasing by construction. Tier: PRO+.",
+    {
+      address: z.string().describe("Token address (0x, 40 hex)"),
+      window: z.enum(["24h", "7d", "30d", "all"]).optional().describe("Curve window (default 7d)"),
+      curve: z.enum(["true", "false"]).optional().describe("false = summary only, no series"),
+    },
+    readOnly,
+    async ({ address, window, curve }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/peak-history`, { window, curve }) }],
+    })
+  );
+
+  server.tool(
+    "rhc_token_risk",
+    "EVM-native risk assessment for a Robinhood Chain token, computed LIVE against a self-hosted RHC node. THIS IS NOT THE SOLANA RISK MODEL: EVM has no mint or freeze authority. Across 300 random RHC tokens only 2.3% even expose an owner() function and 0% expose mint in their own bytecode — so an ABSENT capability flag is the NORM and is NOT a safety signal. Never tell a user a token is safe because can_mint is false. The signals that actually discriminate are proxy upgradeability, LP custody and above all sellability: sellability.sellable is simulated at the chain head through the router and is never cached, because whether a token can be sold changes the moment an owner flips a setting. 'no' means bought-but-cannot-sell (honeypot-shaped). Note owner.model 'none' (no owner function exists at all) is a DIFFERENT answer from 'renounced'. lp_custody is only read for uniswap-v2 pools; v3/v4 liquidity sits in an LP NFT and reports 'unknown' rather than being guessed. Tier: PRO+.",
+    {
+      address: z.string().describe("Token address (0x, 40 hex)"),
+    },
+    readOnly,
+    async ({ address }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/risk`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_token_holders",
+    "Exact holder set and concentration for a Robinhood Chain token. Balances are folded from ERC-20 Transfer logs — NOT derived from trades — and reconciled against on-chain totalSupply() at a pinned block. ALWAYS CHECK verified FIRST: false means the reconstruction is incomplete for that token and unverified_reason explains why (a token that only recently became liquid legitimately has partial history); do not present unverified numbers as exact. Concentration (top1/top10/top50 share, hhi, deployer_pct) EXCLUDES liquidity pools and burn addresses from the circulating denominator, because the largest holder of a token is normally its own pool; those are reported separately as pool_held_pct and burned_pct. balance is a raw uint256 returned as a decimal STRING — never coerce it to a float, it exceeds 2^53. Holder addresses may be ERC-4337 smart accounts, so holder_count is not a headcount of people. Tier: PRO+ (50 rows; ULTRA/BUSINESS raises the cap to 200).",
+    {
+      address: z.string().describe("Token address (0x, 40 hex)"),
+      limit: z.number().int().min(1).max(200).optional().describe("Rows (capped 50 on PRO, 200 on ULTRA/BUSINESS)"),
+      offset: z.number().int().min(0).max(10000).optional().describe("Page offset"),
+    },
+    readOnly,
+    async ({ address, limit, offset }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/holders`, { limit, offset }) }],
+    })
+  );
+
   /* ── Deployer hunter ── */
 
   server.tool(
@@ -553,6 +626,11 @@ const TOOL_CARDS = [
   { name: "rhc_token_buyer_quality", description: "RHC 0–100 early-buyer quality with bundle + dump-cluster legs." },
   { name: "rhc_token_batch_buyer_quality", description: "Early-buyer quality for up to 20 RHC tokens in one call (cap is 20, not 50)." },
   { name: "rhc_token_bundle", description: "RHC launch-bundle detection (same_block) + how much the cohort still holds." },
+  { name: "rhc_token_top_traders", description: "Top traders of an RHC token by REALIZED eth (sell−buy, not PnL) + reputation. PRO+." },
+  { name: "rhc_token_flow", description: "RHC net buy/sell by cohort; net_eth = sell−buy so positive = distributing. PRO+." },
+  { name: "rhc_token_peak_history", description: "RHC peak MC + drawdown + high-water curve; recorded vs observed peak. PRO+." },
+  { name: "rhc_token_risk", description: "RHC EVM-native risk computed live — proxy, LP custody, live honeypot sell-sim. PRO+." },
+  { name: "rhc_token_holders", description: "RHC exact holders + concentration from Transfer-log replay, supply-reconciled. PRO+." },
   { name: "rhc_deployer_leaderboard", description: "RHC deployers ranked by reputation — tier rides runner_rate ($100K) + 24h history." },
   { name: "rhc_deployer_profile", description: "Single RHC deployer profile + 50 most recent tokens." },
   { name: "rhc_deployer_tokens", description: "Paginated RHC deployer launch history with live + peak MC." },
