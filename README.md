@@ -52,7 +52,7 @@ Each tool maps 1:1 to a Robinhood Chain v1 API route — GET, except the two bat
 | `rhc_kol_profile` | `/api/v1/rhc/kol/{wallet}` | BASIC | Single KOL profile — stats over last 200 trades + 50 recent |
 | `rhc_kol_coordination` | `/api/v1/rhc/kol/coordination` | BASIC | Tokens bought by `min_kols`+ distinct KOLs — net ETH, accumulating vs distributing, `time_to_consensus_sec`, per-KOL breakdown |
 | `rhc_kol_first_touches` | `/api/v1/rhc/kol/first-touches` | BASIC | Earliest KOL buy per token (discovery signal) — MC at entry, token age, `tx_hash`. `evm_address` on ULTRA only |
-| `rhc_trades` | `/api/v1/rhc/trades` | PRO+ | DEX trade tape — Uniswap v2/v3/v4 swaps with `trader_eoa` + MEV fields |
+| `rhc_trades` | `/api/v1/rhc/trades` | PRO+ | DEX trade tape — Uniswap v2/v3/v4 swaps with the effective `trader_eoa` + MEV fields |
 | `rhc_tokens` | `/api/v1/rhc/tokens` | PRO+ | Token discovery — MC, liquidity, peak MC + drawdown, launchpad, deployer tier |
 | `rhc_token` | `/api/v1/rhc/tokens/{address}` | BASIC | Token snapshot — price/MC/FDV, deployer block, KOL activity, pools |
 | `rhc_token_batch` | `POST /api/v1/rhc/token/batch` | BASIC | **Up to 50 tokens in one call** — price/MC/FDV, peak MC, deployer reputation. Unknown addresses echo back as `found: false` |
@@ -74,8 +74,9 @@ Each tool maps 1:1 to a Robinhood Chain v1 API route — GET, except the two bat
 
 > BASIC works with any valid key. PRO+ tools return HTTP 403 on a BASIC key — [upgrade at madeonsol.com/pricing](https://madeonsol.com/pricing).
 
-### Two things agents get wrong
+### Three things agents get wrong
 
+- **`trader_eoa` is not simply `tx.from`.** It is the *effective trading account*: `tx.from` on an ordinary transaction, but the ERC-4337 userOp sender (`UserOperationEvent`) when the trade was bundled — never the bundler that relayed the batch, and never the router. It is still an EOA either way; on Robinhood Chain a userOp sender is an ordinary EOA carrying an EIP-7702 delegation, not a smart-contract wallet. Attribute trades and rank wallets on `trader_eoa`; the separate `trader` field is only the swap-log recipient, which is the router on aggregated swaps.
 - **`rhc_deployer_alerts` filters for tradability by default.** Alerts on tokens with `liquidity_usd` under $100 (including unknown liquidity) are dropped — a $45K-MC alert on a drained $68 pool is not a signal. Pass `include_untradeable: true` for the raw tape; the response always echoes the active `tradability_filter`. The alert's `tier` is resolved from the live reputation view at read time, so it can never advertise a reputation the deployer has since lost — the snapshot taken when the alert fired is returned separately as `tier_at_alert`, with `tier_is_stale` flagging the drift.
 - **`graduation_rate` no longer sets the tier.** It still means the $40K peak-MC bar and is still returned everywhere, but `elite`/`good` are earned on `runner_rate` ($100K) plus 24h of deployer history. Ranking deployers by `graduation_rate` is ranking them on a metric the tier ignores.
 

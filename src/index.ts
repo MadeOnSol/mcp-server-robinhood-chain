@@ -117,7 +117,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_kol_feed",
-    "Robinhood Chain (chain id 4663) real-time KOL trade feed — every buy/sell from tracked Solana KOLs' verified EVM wallets, attributed via tx.from from our self-hosted node. EVM-native: token_address (0x), eth_amount, tx_hash, block_number. Each row is enriched with deployer_tier, current/peak MC, and mc_multiple_since_trade ('did the call run'). Tier: BASIC (any valid key).",
+    "Robinhood Chain (chain id 4663) real-time KOL trade feed — every buy/sell from tracked Solana KOLs' verified EVM wallets, attributed to the effective trading account from our self-hosted node (tx.from on an ordinary transaction, or the ERC-4337 userOp sender when the trade was bundled — never the bundler). EVM-native: token_address (0x), eth_amount, tx_hash, block_number. Each row is enriched with deployer_tier, current/peak MC, and mc_multiple_since_trade ('did the call run'). Tier: BASIC (any valid key).",
     {
       limit: z.number().min(1).max(100).default(50).describe("Number of trades to return (1-100)"),
       before: z.string().optional().describe("Cursor — ISO 8601 timestamp; returns trades strictly older than this. Pass next_before to page back."),
@@ -223,7 +223,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_trades",
-    "Robinhood Chain DEX trade tape — every Uniswap v2/v3/v4 swap on chain 4663, ~sub-second from execution. Each row carries the REAL trader wallet (trader_eoa = tx.from, not the router), gas/ordering for MEV analysis, pool state, and is_kol / deployer_tier flags. Cursor via next_before. Tier: PRO+.",
+    "Robinhood Chain DEX trade tape — every Uniswap v2/v3/v4 swap on chain 4663, ~sub-second from execution. Each row carries the effective trading account in trader_eoa, plus gas/ordering for MEV analysis, pool state, and is_kol / deployer_tier flags. Cursor via next_before. Tier: PRO+. IMPORTANT — trader_eoa is NOT simply tx.from: on an ordinary transaction it equals tx.from, but when the trade was bundled through ERC-4337 it is the userOp sender (from UserOperationEvent), never the bundler/relayer that submitted the batch and never the router. It is still an EOA either way — on Robinhood Chain a userOp sender is an ordinary EOA carrying an EIP-7702 delegation, not a smart-contract wallet. Always attribute a trade to trader_eoa; the separate trader field is only the swap-log recipient (the router on aggregated swaps).",
     {
       limit: z.number().min(1).max(100).default(50).describe("Number of trades (1-100)"),
       token: z.string().optional().describe("Filter to one token address (0x, 40 hex)"),
@@ -580,7 +580,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_alpha_wallets",
-    "Robinhood Chain smart-money wallet ranking — trader wallets ranked by realized on-chain performance. net_eth is realized net flow (sell − buy); win_rate is the share of traded tokens taken out profitably; likely_bot flags atomic-arb/MM fleets. memecoin_share = launchpad-token trade share — filter with min_memecoin_share to isolate memecoin traders, or max_avg_mc_usd for low-caps. Refreshed every 15 min. Tier: PRO+.",
+    "Robinhood Chain smart-money wallet ranking — trader wallets ranked by realized on-chain performance. Wallets are effective trading accounts (the ERC-4337 userOp sender where a trade was bundled, not the bundler that relayed it), so relayer addresses do not appear as traders. net_eth is realized net flow (sell − buy); win_rate is the share of traded tokens taken out profitably; likely_bot flags atomic-arb/MM fleets. memecoin_share = launchpad-token trade share — filter with min_memecoin_share to isolate memecoin traders, or max_avg_mc_usd for low-caps. Refreshed every 15 min. Tier: PRO+.",
     {
       classification: z.enum(["all", "human", "bot", "smart_money"]).default("all").describe("human = not likely_bot; smart_money = human + net_eth ≥ 2 + win_rate ≥ 0.45"),
       identity: z.enum(["all", "known_kol", "unknown"]).default("all").describe("known_kol = already mapped to a tracked Solana KOL; unknown = net-new RHC smart money"),
