@@ -8,8 +8,11 @@
  *
  * Key-mode only: authenticate with an `msk_` Bearer API key (get a free key at
  * https://madeonsol.com/pricing — RHC coverage is bundled into every tier). The
- * x402 pay-per-call rail is live on Robinhood Chain too (6 keyless endpoints, discovery at /api/x402/rhc), but is not part of this server. All 25
- * tools map 1:1 to /api/v1/rhc/… routes (GET, plus two POST batch routes).
+ * x402 pay-per-call rail is live on Robinhood Chain too (6 keyless endpoints, discovery at /api/x402/rhc), but is not part of this server. All 52
+ * tools map 1:1 to /api/v1/rhc/… routes: 40 reads (GET, plus two POST batch
+ * routes that are POST only because the address list is too long for a query
+ * string) and 12 rule-engine tools that genuinely mutate (POST / PATCH / DELETE
+ * on copy-trade, price-alert, coordination and first-touch rules).
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -89,19 +92,24 @@ async function query(
 }
 
 /**
- * Perform a POST against a Robinhood Chain batch route. Same auth + error
- * contract as `query` — these routes are POST only because the address list is
- * too large for a query string, not because they mutate anything.
+ * Perform a non-GET request against a Robinhood Chain route. Same auth + error
+ * contract as `query`. Used both by the two POST batch reads (POST only because
+ * the address list is too large for a query string, not because they mutate)
+ * and by the rule-engine CRUD tools, which really do write.
  */
-async function post(path: string, body: unknown): Promise<string> {
+async function mutate(
+  method: "POST" | "PATCH" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<string> {
   if (authMode !== "madeonsol") {
     return "Robinhood Chain tools require MADEONSOL_API_KEY (msk_) — get one free at https://madeonsol.com/pricing (RHC is bundled into every tier).";
   }
   const url = new URL(path, BASE_URL);
   const res = await fetch(url.toString(), {
-    method: "POST",
-    headers: { ...apiKeyHeaders(), "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    method,
+    headers: body === undefined ? apiKeyHeaders() : { ...apiKeyHeaders(), "Content-Type": "application/json" },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -110,7 +118,36 @@ async function post(path: string, body: unknown): Promise<string> {
   return JSON.stringify(await res.json(), null, 2);
 }
 
+/** POST a batch read. Kept as a named helper so the batch tools stay legible. */
+async function post(path: string, body: unknown): Promise<string> {
+  return mutate("POST", path, body);
+}
+
+/** Drop undefined keys so a PATCH sends only the fields the caller actually set
+ *  — the routes reject an empty body with 400 "No fields to update", which is
+ *  the correct answer to "update nothing". `null` is preserved on purpose: it
+ *  is how you CLEAR name / webhook_url. */
+function definedOnly(obj: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj)) if (v !== undefined) out[k] = v;
+  return out;
+}
+
+/* ── Tool annotations ──────────────────────────────────────────────────────
+ * These tell a client whether a tool is safe to call speculatively. Only GET
+ * reads may use `readOnly`. The rule-engine CRUD tools mutate server state that
+ * costs the user quota and fires webhooks, so they must not claim readOnlyHint.
+ *   create — not read-only, not destructive, NOT idempotent (calling twice
+ *            creates two rules and can hit the per-tier cap with a 409).
+ *   update — not read-only, not destructive, idempotent (same PATCH twice
+ *            leaves the same row state).
+ *   destroy — not read-only, DESTRUCTIVE (the row is gone permanently), and
+ *            idempotent only in the sense that a repeat returns 404.
+ */
 const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true };
+const createWrite = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
+const updateWrite = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
+const destroyWrite = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true };
 
 function registerTools(server: McpServer) {
   /* ── KOL intelligence ── */
@@ -607,6 +644,359 @@ function registerTools(server: McpServer) {
       return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/alpha-wallets", params) }] };
     }
   );
+
+  /* ── Copy-trade rules (PRO+) ──
+   * WRITES. These create/modify/delete server-side rules that consume the
+   * caller's per-tier quota and fire webhooks. Quota is PER CHAIN: a full set
+   * of Solana copy-trade rules does NOT consume RHC capacity, and vice versa. */
+
+  server.tool(
+    "rhc_copytrade_list",
+    "List your Robinhood Chain copy-trade rules. Each rule mirrors 1+ source EVM wallets and emits a signal (webhook and/or the rhc:copytrade:signals WS channel) when they trade on chain 4663. Returns id, name, source_wallets, min_trade_eth, only_action, sizing_mode, sizing_amount, delivery_mode, webhook_url, is_active. Rule caps are PER CHAIN and do not consume the Solana copy-trade budget: PRO 3 rules / 5 wallets each, ULTRA 20 / 50, BUSINESS 100 / 250. Tier: PRO+.",
+    {},
+    readOnly,
+    async () => ({
+      content: [{ type: "text" as const, text: await query("/api/v1/rhc/copytrade/subscriptions") }],
+    })
+  );
+
+  server.tool(
+    "rhc_copytrade_create",
+    "CREATE a Robinhood Chain copy-trade rule (POST — this writes and consumes quota; do not call it to explore). Amounts are ETH, not SOL. IMPORTANT: RHC copy-trade has NO market-cap band (no min_mc_usd/max_mc_usd) — unlike the Solana engine — because the RHC KOL trade event carries no market cap, so the filter would either need a per-event DB lookup on a ~3.3M-trades/day chain or silently never match. Returns webhook_secret EXACTLY ONCE when delivery_mode includes 'webhook' — store it, payloads are HMAC-SHA256 over `<timestamp>.<body>` in X-MadeOnSol-Signature. Rule/wallet caps are PER CHAIN (PRO 3 rules / 5 wallets, ULTRA 20 / 50, BUSINESS 100 / 250); exceeding the rule cap returns 409. Tier: PRO+.",
+    {
+      source_wallets: z.array(z.string()).min(1).max(250).describe("1-250 source EVM wallets to mirror (0x, 40 hex). Lowercased on write. Capped by tier: PRO 5, ULTRA 50, BUSINESS 250"),
+      sizing_amount: z.number().positive().describe("Amount in ETH, interpreted by sizing_mode. Required"),
+      name: z.string().min(1).max(64).optional().describe("Optional human label (max 64 chars)"),
+      min_trade_eth: z.number().min(0).optional().describe("Minimum source-wallet trade size in ETH to fire (default 0)"),
+      only_action: z.enum(["buy", "sell", "both"]).optional().describe("Which side to mirror (default 'buy')"),
+      sizing_mode: z.enum(["fixed", "proportional", "percent_source"]).optional().describe("How sizing_amount is interpreted (default 'fixed')"),
+      delivery_mode: z.enum(["webhook", "websocket", "both"]).optional().describe("Where signals are delivered (default 'webhook')"),
+      webhook_url: z.string().url().optional().describe("HTTPS URL — REQUIRED unless delivery_mode is 'websocket'"),
+    },
+    createWrite,
+    async (args) => ({
+      content: [{ type: "text" as const, text: await mutate("POST", "/api/v1/rhc/copytrade/subscriptions", definedOnly(args)) }],
+    })
+  );
+
+  server.tool(
+    "rhc_copytrade_get",
+    "Get ONE Robinhood Chain copy-trade rule by id. Returns 404 if the rule does not exist or is not yours. Tier: PRO+.",
+    {
+      id: z.number().int().positive().describe("Copy-trade rule id (positive integer)"),
+    },
+    readOnly,
+    async ({ id }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/copytrade/subscriptions/${id}`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_copytrade_update",
+    "UPDATE a Robinhood Chain copy-trade rule (PATCH — this writes). Send only the fields you want changed; is_active:false pauses a rule without deleting it. source_wallets is a whole-list REPLACE and is re-checked against the tier wallet cap, so a PRO rule cannot be PATCHed past 5 wallets. Pass null for name or webhook_url to clear them. There is no market-cap band to set on RHC. Tier: PRO+.",
+    {
+      id: z.number().int().positive().describe("Copy-trade rule id (positive integer)"),
+      name: z.string().min(1).max(64).nullable().optional().describe("New label, or null to clear"),
+      source_wallets: z.array(z.string()).min(1).max(250).optional().describe("Replacement wallet list (0x, 40 hex) — re-checked against the tier cap"),
+      min_trade_eth: z.number().min(0).optional().describe("Minimum source trade size in ETH"),
+      only_action: z.enum(["buy", "sell", "both"]).optional().describe("Which side to mirror"),
+      sizing_mode: z.enum(["fixed", "proportional", "percent_source"]).optional().describe("How sizing_amount is interpreted"),
+      sizing_amount: z.number().positive().optional().describe("Amount in ETH"),
+      delivery_mode: z.enum(["webhook", "websocket", "both"]).optional().describe("Where signals are delivered"),
+      webhook_url: z.string().url().nullable().optional().describe("New HTTPS webhook URL, or null to clear"),
+      is_active: z.boolean().optional().describe("false pauses the rule without deleting it"),
+    },
+    updateWrite,
+    async ({ id, ...patch }) => ({
+      content: [{ type: "text" as const, text: await mutate("PATCH", `/api/v1/rhc/copytrade/subscriptions/${id}`, definedOnly(patch)) }],
+    })
+  );
+
+  server.tool(
+    "rhc_copytrade_delete",
+    "DELETE a Robinhood Chain copy-trade rule PERMANENTLY. This cannot be undone — to stop a rule temporarily use rhc_copytrade_update with is_active:false instead. Returns 404 if the rule does not exist or is not yours. Tier: PRO+.",
+    {
+      id: z.number().int().positive().describe("Copy-trade rule id (positive integer)"),
+    },
+    destroyWrite,
+    async ({ id }) => ({
+      content: [{ type: "text" as const, text: await mutate("DELETE", `/api/v1/rhc/copytrade/subscriptions/${id}`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_copytrade_signals",
+    "Fire history for your Robinhood Chain copy-trade rules — the catch-up path after a missed webhook or a dropped WS connection. Each signal carries fired_at, source_wallet, action, token_address/symbol/name, source_eth_amount, suggested_eth_amount, price_usd, dex, tx_hash and delivery status. Retained 7 DAYS, newest first. Read-only. Tier: PRO+.",
+    {
+      limit: z.number().int().min(1).max(500).default(50).describe("Number of signals (1-500, default 50)"),
+      subscription_id: z.number().int().positive().optional().describe("Filter to one of your rules (404 if not yours)"),
+      since: z.string().optional().describe("Only signals fired at or after this ISO 8601 timestamp"),
+    },
+    readOnly,
+    async ({ limit, subscription_id, since }) => {
+      const params: Record<string, string | number> = { limit };
+      if (subscription_id !== undefined) params.subscription_id = subscription_id;
+      if (since) params.since = since;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/copytrade/signals", params) }] };
+    }
+  );
+
+  /* ── Price alerts (PRO+) ──
+   * WRITES. Note the evaluation model differs from Solana: RHC is POLLED. */
+
+  server.tool(
+    "rhc_price_alerts_list",
+    "List your Robinhood Chain price alerts — market-cap dip/recovery alerts on a single RHC token. Returns baseline_mc_usd (captured when the alert was created), drop_pct, recovery_pct, status, dip_low_mc_usd, dip_fired_at, delivery_mode, is_active, expires_at. TIMING: RHC alerts are POLLED on a ~15 SECOND interval against rhc_token_prices — they are NOT sub-second like the Solana price alerts, because the RHC price writer emits no pg_notify. Quota is PER CHAIN and does not consume the Solana price-alert budget: PRO 5 active, ULTRA 25, BUSINESS 125. Tier: PRO+.",
+    {},
+    readOnly,
+    async () => ({
+      content: [{ type: "text" as const, text: await query("/api/v1/rhc/price-alerts") }],
+    })
+  );
+
+  server.tool(
+    "rhc_price_alerts_create",
+    "CREATE a Robinhood Chain price alert (POST — this writes and consumes quota). Fires when the token's market cap falls drop_pct below the baseline captured AT CREATION TIME, and optionally again when it recovers recovery_pct off the dip low. TIMING: evaluation is a ~15 SECOND POLL of rhc_token_prices, not a live price loop — effective latency is that interval plus the token's own price-update cadence, so do NOT assume parity with Solana's sub-second alerts. The token must already be tracked with a market cap on RHC or the call returns 400. Returns webhook_secret EXACTLY ONCE when delivery_mode includes 'webhook'. Active-alert quota is PER CHAIN (PRO 5, ULTRA 25, BUSINESS 125); exceeding it returns 409. Tier: PRO+.",
+    {
+      token_address: z.string().describe("RHC token address (0x, 40 hex). Must be a token we already price"),
+      drop_pct: z.number().min(0.01).max(99.99).describe("Percent drop from the creation-time baseline MC that fires the dip (0.01-99.99)"),
+      name: z.string().min(1).max(64).optional().describe("Optional human label (max 64 chars)"),
+      recovery_pct: z.number().min(0.01).max(1000).optional().describe("Percent rebound off the dip low that fires a recovery event (0.01-1000). Omit for dip-only"),
+      delivery_mode: z.enum(["webhook", "websocket", "both"]).optional().describe("Where events are delivered (default 'webhook')"),
+      webhook_url: z.string().url().optional().describe("HTTPS URL — REQUIRED unless delivery_mode is 'websocket'"),
+    },
+    createWrite,
+    async (args) => ({
+      content: [{ type: "text" as const, text: await mutate("POST", "/api/v1/rhc/price-alerts", definedOnly(args)) }],
+    })
+  );
+
+  server.tool(
+    "rhc_price_alerts_get",
+    "Get ONE Robinhood Chain price alert by id, including its captured baseline_mc_usd, current status and dip_low_mc_usd. Returns 404 if the alert does not exist or is not yours. Tier: PRO+.",
+    {
+      id: z.number().int().positive().describe("Price alert id (positive integer)"),
+    },
+    readOnly,
+    async ({ id }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/price-alerts/${id}`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_price_alerts_update",
+    "UPDATE a Robinhood Chain price alert (PATCH — this writes). Only name, delivery_mode, webhook_url and is_active are mutable. token_address, drop_pct and recovery_pct are IMMUTABLE BY DESIGN: changing a threshold on an already-dipped alert would make its recorded events uninterpretable — delete and recreate instead (which also re-captures the baseline). Pass null for name or webhook_url to clear them. Tier: PRO+.",
+    {
+      id: z.number().int().positive().describe("Price alert id (positive integer)"),
+      name: z.string().min(1).max(64).nullable().optional().describe("New label, or null to clear"),
+      delivery_mode: z.enum(["webhook", "websocket", "both"]).optional().describe("Where events are delivered"),
+      webhook_url: z.string().url().nullable().optional().describe("New HTTPS webhook URL, or null to clear"),
+      is_active: z.boolean().optional().describe("false pauses the alert without deleting it"),
+    },
+    updateWrite,
+    async ({ id, ...patch }) => ({
+      content: [{ type: "text" as const, text: await mutate("PATCH", `/api/v1/rhc/price-alerts/${id}`, definedOnly(patch)) }],
+    })
+  );
+
+  server.tool(
+    "rhc_price_alerts_delete",
+    "DELETE a Robinhood Chain price alert PERMANENTLY. This cannot be undone — to stop it temporarily use rhc_price_alerts_update with is_active:false. Note that recreating an alert re-captures the baseline market cap at the new creation time, so a delete+recreate is NOT a no-op. Tier: PRO+.",
+    {
+      id: z.number().int().positive().describe("Price alert id (positive integer)"),
+    },
+    destroyWrite,
+    async ({ id }) => ({
+      content: [{ type: "text" as const, text: await mutate("DELETE", `/api/v1/rhc/price-alerts/${id}`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_price_alerts_events",
+    "Fire history for your Robinhood Chain price alerts — the catch-up path after a missed webhook or a dropped WS connection. Each event carries event_type ('dip' or 'recovery'), fired_at, token_address, baseline_mc_usd, current_mc_usd, drop_pct_actual, dip_low_mc_usd, recovery_pct_actual and delivery status. Retained 30 DAYS, newest first. Because evaluation is a ~15s poll, fired_at is the poll tick that observed the move, not the exact on-chain moment. Read-only. Tier: PRO+.",
+    {
+      limit: z.number().int().min(1).max(500).default(50).describe("Number of events (1-500, default 50)"),
+      alert_id: z.number().int().positive().optional().describe("Filter to one of your alerts (404 if not yours)"),
+      event_type: z.enum(["dip", "recovery"]).optional().describe("Only dip events or only recovery events"),
+      since: z.string().optional().describe("Only events fired at or after this ISO 8601 timestamp"),
+    },
+    readOnly,
+    async ({ limit, alert_id, event_type, since }) => {
+      const params: Record<string, string | number> = { limit };
+      if (alert_id !== undefined) params.alert_id = alert_id;
+      if (event_type) params.event_type = event_type;
+      if (since) params.since = since;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/price-alerts/events", params) }] };
+    }
+  );
+
+  /* ── Coordination alert rules (PRO+) ── WRITES. */
+
+  server.tool(
+    "rhc_coordination_alerts_list",
+    "List your Robinhood Chain coordination alert rules — rules that fire when min_kols+ tracked KOLs buy the same RHC token inside a rolling window. Returns min_kols, window_minutes, min_score, cooldown_min, score_jump_break, the optional min_mc_usd/max_mc_usd band, delivery_mode and is_active. Rule quota is PER CHAIN and does not consume the Solana coordination budget: PRO 5, ULTRA 20, BUSINESS 100. Tier: PRO+.",
+    {},
+    readOnly,
+    async () => ({
+      content: [{ type: "text" as const, text: await query("/api/v1/rhc/kol/coordination/alerts") }],
+    })
+  );
+
+  server.tool(
+    "rhc_coordination_alerts_create",
+    "CREATE a Robinhood Chain coordination alert rule (POST — this writes and consumes quota). Fires when min_kols+ distinct tracked KOLs buy the same RHC token within window_minutes and the cluster scores at least min_score. SCORING CAVEAT: the shared v1 scorer is used so the number is comparable to Solana, but on RHC the `earliness` component is DEFAULTED to 50 (RHC has no early-entry equivalent) while `quality` is real (KOL 7d win-rate); every fired signal records which components were real in score_inputs. Delivered on the rhc:kol:coordination WS channel and/or an HMAC-signed webhook; webhook_secret is returned EXACTLY ONCE. Rule quota is PER CHAIN (PRO 5, ULTRA 20, BUSINESS 100); exceeding it returns 409. Tier: PRO+.",
+    {
+      name: z.string().min(1).max(64).optional().describe("Optional human label (max 64 chars)"),
+      min_kols: z.number().int().min(2).max(50).optional().describe("Minimum distinct KOL buyers to fire (2-50, default 3)"),
+      window_minutes: z.number().int().min(1).max(60).optional().describe("Rolling cluster window in minutes (1-60, default 15)"),
+      min_score: z.number().int().min(0).max(100).optional().describe("Minimum composite score 0-100 (default 0)"),
+      cooldown_min: z.number().int().min(1).max(1440).optional().describe("Silence per (rule, token) in minutes (1-1440, default 30)"),
+      score_jump_break: z.number().int().min(0).max(100).optional().describe("Re-fire inside the cooldown when the score jumps this many points (0-100, default 20)"),
+      min_mc_usd: z.number().min(0).max(1e12).nullable().optional().describe("Minimum token market cap, or null for no floor"),
+      max_mc_usd: z.number().min(0).max(1e12).nullable().optional().describe("Maximum token market cap — must be >= min_mc_usd"),
+      delivery_mode: z.enum(["websocket", "webhook", "both"]).optional().describe("Where fires are delivered (default 'websocket')"),
+      webhook_url: z.string().url().optional().describe("HTTPS URL — REQUIRED unless delivery_mode is 'websocket'"),
+    },
+    createWrite,
+    async (args) => ({
+      content: [{ type: "text" as const, text: await mutate("POST", "/api/v1/rhc/kol/coordination/alerts", definedOnly(args)) }],
+    })
+  );
+
+  server.tool(
+    "rhc_coordination_alerts_get",
+    "Get ONE Robinhood Chain coordination alert rule by id (UUID). Returns 404 if the rule does not exist or is not yours. Tier: PRO+.",
+    {
+      id: z.string().describe("Coordination rule id (UUID)"),
+    },
+    readOnly,
+    async ({ id }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/kol/coordination/alerts/${encodeURIComponent(id)}`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_coordination_alerts_update",
+    "UPDATE a Robinhood Chain coordination alert rule (PATCH — this writes). Send only the fields you want changed; is_active:false pauses the rule without deleting it. The min_mc_usd <= max_mc_usd check is only applied when BOTH bounds arrive in the same call, so send both together when narrowing a band. Pass null for name, webhook_url, min_mc_usd or max_mc_usd to clear them. Tier: PRO+.",
+    {
+      id: z.string().describe("Coordination rule id (UUID)"),
+      name: z.string().min(1).max(64).nullable().optional().describe("New label, or null to clear"),
+      min_kols: z.number().int().min(2).max(50).optional().describe("Minimum distinct KOL buyers (2-50)"),
+      window_minutes: z.number().int().min(1).max(60).optional().describe("Rolling cluster window in minutes (1-60)"),
+      min_score: z.number().int().min(0).max(100).optional().describe("Minimum composite score 0-100"),
+      cooldown_min: z.number().int().min(1).max(1440).optional().describe("Silence per (rule, token) in minutes (1-1440)"),
+      score_jump_break: z.number().int().min(0).max(100).optional().describe("Re-fire threshold in score points (0-100)"),
+      min_mc_usd: z.number().min(0).max(1e12).nullable().optional().describe("Minimum market cap, or null to clear the floor"),
+      max_mc_usd: z.number().min(0).max(1e12).nullable().optional().describe("Maximum market cap, or null to clear the ceiling"),
+      delivery_mode: z.enum(["websocket", "webhook", "both"]).optional().describe("Where fires are delivered"),
+      webhook_url: z.string().url().nullable().optional().describe("New HTTPS webhook URL, or null to clear"),
+      is_active: z.boolean().optional().describe("false pauses the rule without deleting it"),
+    },
+    updateWrite,
+    async ({ id, ...patch }) => ({
+      content: [{ type: "text" as const, text: await mutate("PATCH", `/api/v1/rhc/kol/coordination/alerts/${encodeURIComponent(id)}`, definedOnly(patch)) }],
+    })
+  );
+
+  server.tool(
+    "rhc_coordination_alerts_delete",
+    "DELETE a Robinhood Chain coordination alert rule PERMANENTLY. This cannot be undone — to stop it temporarily use rhc_coordination_alerts_update with is_active:false. Tier: PRO+.",
+    {
+      id: z.string().describe("Coordination rule id (UUID)"),
+    },
+    destroyWrite,
+    async ({ id }) => ({
+      content: [{ type: "text" as const, text: await mutate("DELETE", `/api/v1/rhc/kol/coordination/alerts/${encodeURIComponent(id)}`) }],
+    })
+  );
+
+  /* ── First-touch subscriptions (ULTRA+) ── WRITES. */
+
+  server.tool(
+    "rhc_first_touch_subscriptions_list",
+    "List your Robinhood Chain first-touch subscriptions — push rules that fire when a token receives its FIRST buy from any tracked KOL (the discovery signal behind rhc_kol_first_touches). Returns the filters object, delivery_mode, webhook_url and is_active. Subscription quota is PER CHAIN and does not consume the Solana first-touch budget: ULTRA 10, BUSINESS 50 (PRO is 0 — this feature is ULTRA+). Tier: ULTRA+.",
+    {},
+    readOnly,
+    async () => ({
+      content: [{ type: "text" as const, text: await query("/api/v1/rhc/kol/first-touches/subscriptions") }],
+    })
+  );
+
+  server.tool(
+    "rhc_first_touch_subscriptions_create",
+    "CREATE a Robinhood Chain first-touch subscription (POST — this writes and consumes quota). Pushes on the rhc:kol:first_touches WS channel and/or an HMAC-signed webhook the moment a token gets its first tracked-KOL buy. FILTER SET DIFFERS FROM SOLANA ON PURPOSE: RHC has no scout-score table, so min_scout_tier and min_n_touches do NOT exist here (a filter that silently matched nothing would be worse than its absence); the RHC quality gates are min_kol_winrate and strategy. Unknown filter keys are REJECTED, not ignored. webhook_secret is returned EXACTLY ONCE. Quota is PER CHAIN (ULTRA 10, BUSINESS 50); exceeding it returns 409. Tier: ULTRA+.",
+    {
+      name: z.string().min(1).max(64).optional().describe("Optional human label (max 64 chars)"),
+      filters: z
+        .object({
+          kol: z.string().optional().describe("Only first touches by this KOL EVM wallet (0x, 40 hex). Lowercased on write"),
+          min_first_buy_eth: z.number().min(0).max(100000).optional().describe("Minimum size of the first buy in ETH"),
+          min_kol_winrate: z.number().min(0).max(1).optional().describe("Minimum KOL 7d win-rate (0-1) — an RHC-only quality gate"),
+          strategy: z.enum(["scalper", "day_trader", "swing", "inactive", "unscored"]).optional().describe("Only KOLs classified with this trading strategy"),
+          min_mc_usd: z.number().min(0).max(1e12).optional().describe("Minimum token market cap at the first touch"),
+          max_mc_usd: z.number().min(0).max(1e12).optional().describe("Maximum token market cap — must be >= min_mc_usd"),
+        })
+        .optional()
+        .describe("Filter object. Omit or {} to receive every first touch. Unknown keys are rejected"),
+      delivery_mode: z.enum(["websocket", "webhook", "both"]).optional().describe("Where events are delivered (default 'websocket')"),
+      webhook_url: z.string().url().optional().describe("HTTPS URL — REQUIRED unless delivery_mode is 'websocket'"),
+    },
+    createWrite,
+    async (args) => ({
+      content: [{ type: "text" as const, text: await mutate("POST", "/api/v1/rhc/kol/first-touches/subscriptions", definedOnly(args)) }],
+    })
+  );
+
+  server.tool(
+    "rhc_first_touch_subscriptions_get",
+    "Get ONE Robinhood Chain first-touch subscription by id (UUID), including its stored filters object. Returns 404 if the subscription does not exist or is not yours. Tier: ULTRA+.",
+    {
+      id: z.string().describe("First-touch subscription id (UUID)"),
+    },
+    readOnly,
+    async ({ id }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/kol/first-touches/subscriptions/${encodeURIComponent(id)}`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_first_touch_subscriptions_update",
+    "UPDATE a Robinhood Chain first-touch subscription (PATCH — this writes). CAREFUL: `filters` is a WHOLE-OBJECT REPLACE, not a merge — send the complete filter set you want, because any key you omit is removed (that is the only way to express 'drop this filter'). Read the current filters with rhc_first_touch_subscriptions_get first. is_active:false pauses without deleting. Pass null for name or webhook_url to clear them. Tier: ULTRA+.",
+    {
+      id: z.string().describe("First-touch subscription id (UUID)"),
+      name: z.string().min(1).max(64).nullable().optional().describe("New label, or null to clear"),
+      filters: z
+        .object({
+          kol: z.string().optional().describe("Only first touches by this KOL EVM wallet (0x, 40 hex)"),
+          min_first_buy_eth: z.number().min(0).max(100000).optional().describe("Minimum size of the first buy in ETH"),
+          min_kol_winrate: z.number().min(0).max(1).optional().describe("Minimum KOL 7d win-rate (0-1)"),
+          strategy: z.enum(["scalper", "day_trader", "swing", "inactive", "unscored"]).optional().describe("Only KOLs with this trading strategy"),
+          min_mc_usd: z.number().min(0).max(1e12).optional().describe("Minimum token market cap at the first touch"),
+          max_mc_usd: z.number().min(0).max(1e12).optional().describe("Maximum token market cap — must be >= min_mc_usd"),
+        })
+        .optional()
+        .describe("REPLACES the stored filter object wholesale — omitted keys are dropped, not kept"),
+      delivery_mode: z.enum(["websocket", "webhook", "both"]).optional().describe("Where events are delivered"),
+      webhook_url: z.string().url().nullable().optional().describe("New HTTPS webhook URL, or null to clear"),
+      is_active: z.boolean().optional().describe("false pauses the subscription without deleting it"),
+    },
+    updateWrite,
+    async ({ id, ...patch }) => ({
+      content: [{ type: "text" as const, text: await mutate("PATCH", `/api/v1/rhc/kol/first-touches/subscriptions/${encodeURIComponent(id)}`, definedOnly(patch)) }],
+    })
+  );
+
+  server.tool(
+    "rhc_first_touch_subscriptions_delete",
+    "DELETE a Robinhood Chain first-touch subscription PERMANENTLY. This cannot be undone — to stop it temporarily use rhc_first_touch_subscriptions_update with is_active:false. Tier: ULTRA+.",
+    {
+      id: z.string().describe("First-touch subscription id (UUID)"),
+    },
+    destroyWrite,
+    async ({ id }) => ({
+      content: [{ type: "text" as const, text: await mutate("DELETE", `/api/v1/rhc/kol/first-touches/subscriptions/${encodeURIComponent(id)}`) }],
+    })
+  );
 }
 
 /** Tool catalog for discovery cards (Smithery / glama). Keep in sync with registerTools. */
@@ -641,6 +1031,28 @@ const TOOL_CARDS = [
   { name: "rhc_deployer_alerts", description: "RHC deployer alerts — tradability-filtered by default, tier resolved at read time." },
   { name: "rhc_recent_bonds", description: "RHC tokens that just crossed the $40K peak-MC graduation milestone." },
   { name: "rhc_alpha_wallets", description: "RHC smart-money wallets — net_eth, win_rate, memecoin_share, likely_bot. PRO+." },
+  { name: "rhc_copytrade_list", description: "List RHC copy-trade rules. Quota is per-chain. PRO+." },
+  { name: "rhc_copytrade_create", description: "WRITES — create an RHC copy-trade rule (ETH sizing, no MC band). PRO+." },
+  { name: "rhc_copytrade_get", description: "Get one RHC copy-trade rule by id. PRO+." },
+  { name: "rhc_copytrade_update", description: "WRITES — patch an RHC copy-trade rule; source_wallets is a replace. PRO+." },
+  { name: "rhc_copytrade_delete", description: "DESTRUCTIVE — permanently delete an RHC copy-trade rule. PRO+." },
+  { name: "rhc_copytrade_signals", description: "RHC copy-trade fire history (7-day catch-up feed). PRO+." },
+  { name: "rhc_price_alerts_list", description: "List RHC price alerts — ~15s polled, not sub-second. PRO+." },
+  { name: "rhc_price_alerts_create", description: "WRITES — create an RHC MC dip/recovery alert (~15s poll). PRO+." },
+  { name: "rhc_price_alerts_get", description: "Get one RHC price alert by id, with its captured baseline MC. PRO+." },
+  { name: "rhc_price_alerts_update", description: "WRITES — patch an RHC price alert; thresholds are immutable. PRO+." },
+  { name: "rhc_price_alerts_delete", description: "DESTRUCTIVE — permanently delete an RHC price alert. PRO+." },
+  { name: "rhc_price_alerts_events", description: "RHC price-alert fire history (30-day dip/recovery events). PRO+." },
+  { name: "rhc_coordination_alerts_list", description: "List RHC coordination alert rules. Quota is per-chain. PRO+." },
+  { name: "rhc_coordination_alerts_create", description: "WRITES — create an RHC N-KOL coordination rule (earliness defaulted). PRO+." },
+  { name: "rhc_coordination_alerts_get", description: "Get one RHC coordination alert rule by UUID. PRO+." },
+  { name: "rhc_coordination_alerts_update", description: "WRITES — patch an RHC coordination alert rule. PRO+." },
+  { name: "rhc_coordination_alerts_delete", description: "DESTRUCTIVE — permanently delete an RHC coordination rule. PRO+." },
+  { name: "rhc_first_touch_subscriptions_list", description: "List RHC first-touch push subscriptions. ULTRA+." },
+  { name: "rhc_first_touch_subscriptions_create", description: "WRITES — create an RHC first-touch push subscription. ULTRA+." },
+  { name: "rhc_first_touch_subscriptions_get", description: "Get one RHC first-touch subscription by UUID. ULTRA+." },
+  { name: "rhc_first_touch_subscriptions_update", description: "WRITES — patch an RHC first-touch sub; filters REPLACE wholesale. ULTRA+." },
+  { name: "rhc_first_touch_subscriptions_delete", description: "DESTRUCTIVE — permanently delete an RHC first-touch subscription. ULTRA+." },
 ];
 
 async function main() {
