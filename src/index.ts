@@ -645,6 +645,153 @@ function registerTools(server: McpServer) {
     }
   );
 
+  /* ── Wallet intelligence (PRO+) ──
+   * rhc_wallet / rhc_wallet_pnl / rhc_wallet_positions share ONE 90-day
+   * snapshot cache server-side, so calling all three on the same address costs
+   * roughly one computation. Every figure is ETH-denominated. */
+
+  server.tool(
+    "rhc_wallet",
+    "Robinhood Chain wallet profile — any wallet's 90-day trading profile: FIFO cost-basis PnL, per-token breakdown, recent trades, and a reputation block (is_kol, is_deployer + deployer_tier, is_alpha_tracked, dump-cluster membership, early_buyer_tokens). Denomination is ETH, not SOL or USD. IMPORTANT: stats.unattributed_trades counts pre-2026-07-18 rows whose trader_eoa is NULL — those are unattributable by design and are excluded from every PnL figure, so a low analyzed_trades on an old wallet is a data-window limit, not inactivity. stats_unavailable=true means the snapshot timed out (flags still resolve). Tier: PRO+.",
+    {
+      address: z.string().describe("Wallet EVM address (0x, 40 hex). Case-insensitive — lowercased server-side"),
+    },
+    readOnly,
+    async ({ address }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/wallet/${encodeURIComponent(address)}`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_wallet_pnl",
+    "Robinhood Chain wallet FIFO cost-basis PnL over 90 days — realized/unrealized split, a daily realized curve (pnl_curve), every closed position with roi_pct and hold_minutes, and every open position marked to the current price. Same FIFO implementation as the Solana /wallet/{address}/pnl, so the two chains are directly comparable. IMPORTANT: notes.cost_basis_observable_from is the date the window opens — buys before it are invisible to cost basis, which is why a long-held position can appear as a sell with no matching buy. Check notes.partial before quoting totals. Amounts are ETH. Tier: PRO+.",
+    {
+      address: z.string().describe("Wallet EVM address (0x, 40 hex)"),
+    },
+    readOnly,
+    async ({ address }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/wallet/${encodeURIComponent(address)}/pnl`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_wallet_positions",
+    "Robinhood Chain wallet open positions — only what the wallet still holds, marked to the current price. Same FIFO pass as rhc_wallet_pnl without the curve and closed positions; use this for 'what is this wallet in right now'. IMPORTANT: positions[].liquidity_basis='v4_virtual_ceiling' means liquidity_usd is a bonding-curve VIRTUAL ceiling, not withdrawable TVL — never size an exit against it; 'measured' means real pool reserves. summary.unpriced_positions are excluded from the value and unrealized totals. Amounts are ETH. Tier: PRO+.",
+    {
+      address: z.string().describe("Wallet EVM address (0x, 40 hex)"),
+    },
+    readOnly,
+    async ({ address }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/wallet/${encodeURIComponent(address)}/positions`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_wallet_trades",
+    "Robinhood Chain single-wallet trade tape — one wallet's swaps, newest first, cursor-paginated on an opaque next_before keyset. Distinct from rhc_trades with a token filter: that filters the GLOBAL tape by token, this filters by WALLET (a different index path). Pass the previous response's next_before back as `before` to page; it is an opaque cursor, not an offset. Tier: PRO+.",
+    {
+      address: z.string().describe("Wallet EVM address (0x, 40 hex)"),
+      limit: z.number().min(1).max(200).default(50).describe("Page size (1-200, default 50)"),
+      before: z.string().optional().describe("Opaque keyset cursor — pass the previous response's next_before"),
+      since: z.string().optional().describe("ISO-8601 timestamp with offset; only trades newer than this"),
+      action: z.enum(["buy", "sell"]).optional().describe("Restrict to one side"),
+      token: z.string().optional().describe("Restrict to one token address (0x, 40 hex)"),
+    },
+    readOnly,
+    async ({ address, ...rest }) => {
+      const params: Record<string, string | number> = {};
+      for (const [k, v] of Object.entries(rest)) if (v !== undefined) params[k] = v as string | number;
+      return {
+        content: [{ type: "text" as const, text: await query(`/api/v1/rhc/wallet/${encodeURIComponent(address)}/trades`, params) }],
+      };
+    }
+  );
+
+  /* ── Wallet tracker / watchlist (PRO+) ──
+   * Quotas are PER CHAIN — PRO 50 / ULTRA 100 / BUSINESS 500 RHC wallets,
+   * independent of the Solana watchlist. */
+
+  server.tool(
+    "rhc_wallet_tracker_list",
+    "List the wallets on your Robinhood Chain watchlist. Quotas are PER CHAIN — PRO 50 / ULTRA 100 / BUSINESS 500 RHC wallets, independent of your Solana watchlist, so adopting RHC never shrinks an existing Solana list. Returns each wallet_address, label and added_at, plus count/limit/remaining. Tier: PRO+.",
+    {},
+    readOnly,
+    async () => ({
+      content: [{ type: "text" as const, text: await query("/api/v1/rhc/wallet-tracker/watchlist") }],
+    })
+  );
+
+  server.tool(
+    "rhc_wallet_tracker_add",
+    "ADD a wallet to your Robinhood Chain watchlist (POST — this writes and consumes your per-chain quota). The address is stored lowercase so it matches rhc_trades.trader_eoa; a checksummed 0xAbC… would join to nothing and the wallet would look permanently silent. Returns 409 if the wallet is already tracked, and 403 once you are at your tier cap. Tier: PRO+.",
+    {
+      wallet_address: z.string().describe("Wallet EVM address to track (0x, 40 hex). Lowercased on write"),
+      label: z.string().min(1).max(64).optional().describe("Optional human label (1-64 chars). Omit to leave unlabelled — null is rejected here"),
+    },
+    createWrite,
+    async (args) => ({
+      content: [{ type: "text" as const, text: await mutate("POST", "/api/v1/rhc/wallet-tracker/watchlist", definedOnly(args)) }],
+    })
+  );
+
+  server.tool(
+    "rhc_wallet_tracker_remove",
+    "DESTRUCTIVE — permanently remove a wallet from your Robinhood Chain watchlist. Frees one slot against your per-chain quota. Returns 404 if the wallet is not on your list. Tier: PRO+.",
+    {
+      address: z.string().describe("Tracked wallet EVM address (0x, 40 hex)"),
+    },
+    destroyWrite,
+    async ({ address }) => ({
+      content: [{ type: "text" as const, text: await mutate("DELETE", `/api/v1/rhc/wallet-tracker/watchlist/${encodeURIComponent(address)}`) }],
+    })
+  );
+
+  server.tool(
+    "rhc_wallet_tracker_relabel",
+    "WRITES — change the label on a tracked Robinhood Chain wallet. Pass label=null to clear it (unlike the add tool, null IS accepted here). Returns 404 if the wallet is not on your watchlist. Tier: PRO+.",
+    {
+      address: z.string().describe("Tracked wallet EVM address (0x, 40 hex)"),
+      label: z.string().min(1).max(64).nullable().describe("New label (1-64 chars), or null to clear it"),
+    },
+    updateWrite,
+    async ({ address, label }) => ({
+      content: [{ type: "text" as const, text: await mutate("PATCH", `/api/v1/rhc/wallet-tracker/watchlist/${encodeURIComponent(address)}`, { label }) }],
+    })
+  );
+
+  server.tool(
+    "rhc_wallet_tracker_trades",
+    "Merged trade feed across every wallet on your Robinhood Chain watchlist, newest first, each row labelled with its watchlist label. The cursor (next_before) is an opaque keyset matching the rest of the RHC tree, NOT the Solana tracker's integer epoch. A `wallet` filter must already be on your watchlist or the call returns 400. Tier: PRO+.",
+    {
+      limit: z.number().min(1).max(200).default(50).describe("Page size (1-200, default 50)"),
+      before: z.string().optional().describe("Opaque keyset cursor — pass the previous response's next_before"),
+      wallet: z.string().optional().describe("Restrict to one tracked wallet (must already be on the watchlist)"),
+      action: z.enum(["buy", "sell"]).optional().describe("Restrict to one side"),
+      token: z.string().optional().describe("Restrict to one token address (0x, 40 hex)"),
+    },
+    readOnly,
+    async (args) => {
+      const params: Record<string, string | number> = {};
+      for (const [k, v] of Object.entries(args)) if (v !== undefined) params[k] = v as string | number;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/wallet-tracker/trades", params) }] };
+    }
+  );
+
+  server.tool(
+    "rhc_wallet_tracker_summary",
+    "Per-wallet buy/sell/volume rollup across your tracked Robinhood Chain wallets. Sourced from rhc_trades DIRECTLY, not from a per-subscriber capture log — on RHC every swap is already recorded, so adding a wallet gives you its full history immediately rather than only from the moment you started tracking it. (The Solana tracker cannot do this: there, trades are only captured for wallets somebody asked for.) stats_unavailable=true means the rollup timed out and the per-wallet stats are zeroed, not absent. Tier: PRO+.",
+    {
+      period: z.string().default("7d").describe("Lookback window, e.g. '24h', '7d', '30d' (default '7d')"),
+      wallet: z.string().optional().describe("Restrict the rollup to one tracked wallet"),
+    },
+    readOnly,
+    async (args) => {
+      const params: Record<string, string | number> = {};
+      for (const [k, v] of Object.entries(args)) if (v !== undefined) params[k] = v as string | number;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/wallet-tracker/summary", params) }] };
+    }
+  );
+
   /* ── Copy-trade rules (PRO+) ──
    * WRITES. These create/modify/delete server-side rules that consume the
    * caller's per-tier quota and fire webhooks. Quota is PER CHAIN: a full set
@@ -1031,6 +1178,16 @@ const TOOL_CARDS = [
   { name: "rhc_deployer_alerts", description: "RHC deployer alerts — tradability-filtered by default, tier resolved at read time." },
   { name: "rhc_recent_bonds", description: "RHC tokens that just crossed the $40K peak-MC graduation milestone." },
   { name: "rhc_alpha_wallets", description: "RHC smart-money wallets — net_eth, win_rate, memecoin_share, likely_bot. PRO+." },
+  { name: "rhc_wallet", description: "RHC wallet 90-day profile — ETH PnL, per-token breakdown, reputation flags. PRO+." },
+  { name: "rhc_wallet_pnl", description: "RHC wallet FIFO cost-basis PnL — curve, closed + open positions. PRO+." },
+  { name: "rhc_wallet_positions", description: "RHC wallet open positions marked to market; check liquidity_basis. PRO+." },
+  { name: "rhc_wallet_trades", description: "One RHC wallet's trade tape, keyset-paginated by wallet (not token). PRO+." },
+  { name: "rhc_wallet_tracker_list", description: "List your RHC watchlist. Quota is per-chain. PRO+." },
+  { name: "rhc_wallet_tracker_add", description: "WRITES — track an RHC wallet (address lowercased on write). PRO+." },
+  { name: "rhc_wallet_tracker_remove", description: "DESTRUCTIVE — untrack an RHC wallet, freeing a quota slot. PRO+." },
+  { name: "rhc_wallet_tracker_relabel", description: "WRITES — relabel a tracked RHC wallet; null clears the label. PRO+." },
+  { name: "rhc_wallet_tracker_trades", description: "Merged trade feed across your tracked RHC wallets, label-tagged. PRO+." },
+  { name: "rhc_wallet_tracker_summary", description: "Per-wallet rollup from rhc_trades — full history, not capture-log scoped. PRO+." },
   { name: "rhc_copytrade_list", description: "List RHC copy-trade rules. Quota is per-chain. PRO+." },
   { name: "rhc_copytrade_create", description: "WRITES — create an RHC copy-trade rule (ETH sizing, no MC band). PRO+." },
   { name: "rhc_copytrade_get", description: "Get one RHC copy-trade rule by id. PRO+." },

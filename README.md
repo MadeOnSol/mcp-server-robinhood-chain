@@ -17,6 +17,8 @@ RHC coverage is **bundled into every tier at no extra cost**. Get a free API key
 
 > **Key-mode only.** Authenticate with an `msk_` Bearer API key (`MADEONSOL_API_KEY`). Robinhood Chain does have a keyless x402 pay-per-call rail — a deliberately narrow 6-endpoint subset, documented at [madeonsol.com/robinhood/x402](https://madeonsol.com/robinhood/x402) — but it is not part of this server.
 
+> **New in 0.6.0 — wallet intelligence.** Ten new operations covering the Robinhood Chain wallet surface, which had no SDK binding at all until now: `rhc_wallet`, `rhc_wallet_pnl`, `rhc_wallet_positions`, `rhc_wallet_trades`, plus the watchlist tools — `rhc_wallet_tracker_list`, `rhc_wallet_tracker_add`, `rhc_wallet_tracker_remove`, `rhc_wallet_tracker_relabel`, `rhc_wallet_tracker_trades` and `rhc_wallet_tracker_summary`. Everything is **ETH**-denominated, and cost basis is FIFO over a rolling 90-day window — `cost_basis_observable_from` names the date the window opens, so a position opened before it reads as a sell with no matching buy. The profile / PnL / positions trio shares ONE snapshot cache server-side, so calling all three on an address costs roughly one computation rather than three; `cache_hit` says which call paid for it. Watchlist quotas are **per chain** (PRO 50 / ULTRA 100 / BUSINESS 500 RHC wallets), independent of your Solana list.
+
 ## Install & configure
 
 Add to your MCP client config (Claude Desktop, Cursor, Claude Code). No install step — `npx` fetches it on first run:
