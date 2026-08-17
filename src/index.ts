@@ -8,11 +8,12 @@
  *
  * Key-mode only: authenticate with an `msk_` Bearer API key (get a free key at
  * https://madeonsol.com/pricing — RHC coverage is bundled into every tier). The
- * x402 pay-per-call rail is live on Robinhood Chain too (6 keyless endpoints, discovery at /api/x402/rhc), but is not part of this server. All 52
- * tools map 1:1 to /api/v1/rhc/… routes: 40 reads (GET, plus two POST batch
+ * x402 pay-per-call rail is live on Robinhood Chain too (6 keyless endpoints, discovery at /api/x402/rhc), but is not part of this server. All 64
+ * tools map 1:1 to /api/v1/rhc/… routes: 49 reads (GET, plus two POST batch
  * routes that are POST only because the address list is too long for a query
- * string) and 12 rule-engine tools that genuinely mutate (POST / PATCH / DELETE
- * on copy-trade, price-alert, coordination and first-touch rules).
+ * string) and 15 tools that genuinely mutate (POST / PATCH / DELETE on
+ * copy-trade, price-alert, coordination and first-touch rules, plus the three
+ * wallet-watchlist mutations).
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -281,6 +282,29 @@ function registerTools(server: McpServer) {
     }
   );
 
+  server.tool(
+    "rhc_lp_events",
+    "Robinhood Chain liquidity REMOVALS feed — the rug signal. Every Uniswap v2/v3 Burn and every v4 ModifyLiquidity with a NEGATIVE delta on tracked pools, decoded from our own node's log subscription, newest first. REMOVALS ONLY: liquidity ADDS are not persisted at all (v4 adds share the topic and are dropped at decode time; v2/v3 Mint is not subscribed), so every row is event:'remove', an empty page means 'no removals seen' and NEVER 'no liquidity activity', and the response's coverage block says adds_persisted:false — do not present this as an add/remove ledger. Amounts are RAW on-chain uint256 integers returned as decimal STRINGS (liquidity, amount0, amount1, token_amount_raw, quote_amount_raw) — never coerce them to floats; token0/token1 say which pool side is which and token_amount_raw / quote_token / quote_amount_raw pre-resolve the token side. v4 rows carry liquidity only — the pool manager emits no token amounts (protocol, not a gap). provider is the wallet that pulled; provider_is_token_deployer=true is the classic rug shape, with provider_deployer_tier / provider_kol_name enrichment. block_time is the exact block header timestamp. Cursor: pass next_before back as `before` (same opaque (block_time,id) keyset as rhc_trades). Data since 2026-08-05. Tier: PRO+ (403 on BASIC).",
+    {
+      limit: z.number().int().min(1).max(200).default(50).describe("Number of events (1-200)"),
+      token: z.string().optional().describe("Filter to one token address (0x, 40 hex)"),
+      pool: z.string().optional().describe("Pool address (v2/v3) or bytes32 poolId (v4)"),
+      provider: z.string().optional().describe("Filter to one liquidity provider — the wallet that pulled (0x, 40 hex)"),
+      dex: z.enum(["uniswap-v2", "uniswap-v3", "uniswap-v4"]).optional().describe("Filter by DEX version"),
+      before: z.string().optional().describe("Opaque cursor from a previous response's next_before"),
+    },
+    readOnly,
+    async ({ limit, token, pool, provider, dex, before }) => {
+      const params: Record<string, string | number> = { limit };
+      if (token) params.token = token;
+      if (pool) params.pool = pool;
+      if (provider) params.provider = provider;
+      if (dex) params.dex = dex;
+      if (before) params.before = before;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/lp-events", params) }] };
+    }
+  );
+
   /* ── Token discovery + intelligence ── */
 
   server.tool(
@@ -301,6 +325,24 @@ function registerTools(server: McpServer) {
       if (min_liquidity_usd !== undefined) params.min_liquidity_usd = min_liquidity_usd;
       if (launchpad) params.launchpad = launchpad;
       return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/tokens", params) }] };
+    }
+  );
+
+  server.tool(
+    "rhc_equities",
+    "Robinhood Chain tokenized equities — every official Robinhood tokenized stock and ETF (NVDA, SPY, AAPL, …) with live price / market cap / liquidity and 24h trades, ETH volume, buys/sells and distinct buyers/sellers. IDENTITY IS THE ISSUER BEACON, NEVER THE NAME: a token is listed only if its contract is an EIP-1967 beacon proxy on Robinhood's issuer beacon 0xe10b6f6b275de231345c20d14ab812db62151b00, read from our own node (re-classified every 10 min). The day this shipped there were 20 fake 'GameStop • Robinhood Token' contracts and 8 fake NVDAs carrying the exact official name suffix — none appear here, and a token that merely LOOKS like an equity by name will not either; issuer_beacon is echoed per row so you can verify. verified is always true by construction. name has the '• Robinhood Token' suffix stripped for display; onchain_name is the raw ERC-20 name. price_usd / market_cap_usd / liquidity_usd may be null for a listed-but-not-yet-priced equity; check liquidity_basis. Use symbol for an exact ticker (case-insensitive) or q for a substring of symbol/name; sort by volume (default) / trades / market_cap / last_trade / symbol. 24h stats are cached 60 s (stats_as_of). This is a discovery surface — per-token drill-downs (rhc_token, rhc_token_holders, …) keep their own gates. Tier: BASIC (any valid key).",
+    {
+      sort: z.enum(["volume", "trades", "market_cap", "last_trade", "symbol"]).default("volume").describe("Ordering (default volume = 24h ETH volume, descending; symbol is ascending)"),
+      limit: z.number().int().min(1).max(300).default(100).describe("Rows (1-300)"),
+      symbol: z.string().optional().describe("Exact ticker, case-insensitive (e.g. NVDA)"),
+      q: z.string().optional().describe("Substring of symbol or name"),
+    },
+    readOnly,
+    async ({ sort, limit, symbol, q }) => {
+      const params: Record<string, string | number> = { sort, limit };
+      if (symbol) params.symbol = symbol;
+      if (q) params.q = q;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/equities", params) }] };
     }
   );
 
@@ -1155,7 +1197,9 @@ const TOOL_CARDS = [
   { name: "rhc_kol_coordination", description: "RHC tokens bought by N+ distinct KOLs — net ETH, accumulating vs distributing." },
   { name: "rhc_kol_first_touches", description: "RHC earliest KOL buy per token — the discovery signal, with MC at entry." },
   { name: "rhc_trades", description: "RHC DEX trade tape — Uniswap v2/v3/v4 swaps with trader_eoa + MEV fields. PRO+." },
+  { name: "rhc_lp_events", description: "RHC liquidity REMOVALS feed (rug signal) — v2/v3 Burn + v4 negative ModifyLiquidity, raw uint256 strings, removals only. PRO+." },
   { name: "rhc_tokens", description: "RHC token discovery — MC, liquidity, peak MC, launchpad, deployer tier. PRO+." },
+  { name: "rhc_equities", description: "RHC tokenized stocks & ETFs (NVDA, SPY, AAPL…) — beacon-verified identity, live price/MC/liquidity + 24h trades/volume/buyer-seller split. BASIC." },
   { name: "rhc_token", description: "RHC token snapshot — price/MC/FDV, deployer block, KOL activity, pools." },
   { name: "rhc_token_batch", description: "Up to 50 RHC tokens in one call — price/MC/FDV, peak MC, deployer reputation." },
   { name: "rhc_token_candles", description: "RHC 1-minute OHLC candles — price + MC OHLC, volume buy/sell split. PRO+." },

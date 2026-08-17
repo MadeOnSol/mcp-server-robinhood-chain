@@ -17,6 +17,8 @@ RHC coverage is **bundled into every tier at no extra cost**. Get a free API key
 
 > **Key-mode only.** Authenticate with an `msk_` Bearer API key (`MADEONSOL_API_KEY`). Robinhood Chain does have a keyless x402 pay-per-call rail — a deliberately narrow 6-endpoint subset, documented at [madeonsol.com/robinhood/x402](https://madeonsol.com/robinhood/x402) — but it is not part of this server.
 
+> **New in 0.8.0 — tokenized equities + the liquidity-removals feed.** Two new tools. `rhc_equities` (`GET /rhc/equities`, **BASIC**) lists every official Robinhood tokenized stock and ETF (NVDA, SPY, AAPL, …) with live price / MC / liquidity and 24h trades, ETH volume and buyer-seller split, sortable by `volume` / `trades` / `market_cap` / `last_trade` / `symbol`, filterable by exact `symbol` or substring `q`. **Identity is the issuer beacon, never the name**: a token is listed only if its contract is an EIP-1967 beacon proxy on Robinhood's issuer beacon `0xe10b6f6b…151b00`, read from our own node — on ship day there were 20 fake "GameStop • Robinhood Token" contracts and 8 fake NVDAs with the exact official suffix, and none of them appear. `rhc_lp_events` (`GET /rhc/lp-events`, **PRO+**) is the rug signal: Uniswap v2/v3 `Burn` and v4 `ModifyLiquidity` with a negative delta on tracked pools, from our node's log subscription, filterable by `token` / `pool` / `provider` / `dex` and cursor-paginated on `next_before`. **Removals only** — adds are not persisted (the response's `coverage` block says `adds_persisted: false`), amounts are raw uint256 **strings**, v4 rows carry `liquidity` only, and `provider_is_token_deployer` is the classic rug tell. Data since 2026-08-05.
+
 > **New in 0.7.0 — `holder_growth`: who arrived and who left.** The `rhc_token_holders` tool now returns `holder_growth` on `GET /rhc/tokens/{address}/holders`: `{ "1h", "24h", "7d" }` × `{ cutoff_block, entered, entered_still_holding, exited, net }`. *entered* = addresses whose first `Transfer` of the token landed at-or-after the window's cutoff block (any current balance); *entered_still_holding* = those still non-zero; *exited* = pre-existing holders whose last movement in the window left them at zero; *net* ≈ the change in `holder_count`. Pools and burn addresses are excluded from every count. This exists because RHC balances are folded from ERC-20 Transfer logs on our own node — the fold keeps first-seen and last-moved blocks per address and retains zero-balance rows — so it is a direct read, not an estimate; the Solana census is a point-in-time ledger scan with no history and cannot answer this. A window is `null` (never 0) only when the chain had no ingested trades in it; the whole block is `null` only if the growth read failed. Sanity check from ship day: a token launched that morning showed 593 entered / 560 still holding over 24h, and `holder_count` was exactly 560.
 
 > **New in 0.6.0 — wallet intelligence.** Ten new operations covering the Robinhood Chain wallet surface, which had no SDK binding at all until now: `rhc_wallet`, `rhc_wallet_pnl`, `rhc_wallet_positions`, `rhc_wallet_trades`, plus the watchlist tools — `rhc_wallet_tracker_list`, `rhc_wallet_tracker_add`, `rhc_wallet_tracker_remove`, `rhc_wallet_tracker_relabel`, `rhc_wallet_tracker_trades` and `rhc_wallet_tracker_summary`. Everything is **ETH**-denominated, and cost basis is FIFO over a rolling 90-day window — `cost_basis_observable_from` names the date the window opens, so a position opened before it reads as a sell with no matching buy. The profile / PnL / positions trio shares ONE snapshot cache server-side, so calling all three on an address costs roughly one computation rather than three; `cache_hit` says which call paid for it. Watchlist quotas are **per chain** (PRO 50 / ULTRA 100 / BUSINESS 500 RHC wallets), independent of your Solana list.
@@ -46,9 +48,9 @@ Then ask your agent things like *"What are tracked KOLs buying on Robinhood Chai
 - **stdio** (default) — for local clients (Claude Desktop, Cursor, Claude Code).
 - **http** — set `MCP_TRANSPORT=http` (+ optional `PORT`, default 3100) for hosted environments (Smithery, etc.). Exposes `/health` and `/.well-known/mcp/server-card.json`.
 
-## Tools — all 52 Robinhood Chain routes
+## Tools — all 64 Robinhood Chain routes
 
-Each tool maps 1:1 to a Robinhood Chain v1 API route. **40 are reads** (GET, plus the two batch tools which POST an address list only because it is too long for a query string) and **12 genuinely write** (POST / PATCH / DELETE on the rule engines) — those are marked ✍️ / 🗑️ below and carry non-`readOnly` MCP annotations, so a well-behaved client will not call them speculatively. Fields are EVM-native.
+Each tool maps 1:1 to a Robinhood Chain v1 API route. **49 are reads** (GET, plus the two batch tools which POST an address list only because it is too long for a query string) and **15 genuinely write** (POST / PATCH / DELETE on the rule engines, plus the three wallet-watchlist mutations) — those are marked ✍️ / 🗑️ below and carry non-`readOnly` MCP annotations, so a well-behaved client will not call them speculatively. Fields are EVM-native.
 
 ### Reads
 
@@ -61,7 +63,9 @@ Each tool maps 1:1 to a Robinhood Chain v1 API route. **40 are reads** (GET, plu
 | `rhc_kol_coordination` | `/api/v1/rhc/kol/coordination` | BASIC | Tokens bought by `min_kols`+ distinct KOLs — net ETH, accumulating vs distributing, `time_to_consensus_sec`, per-KOL breakdown |
 | `rhc_kol_first_touches` | `/api/v1/rhc/kol/first-touches` | BASIC | Earliest KOL buy per token (discovery signal) — MC at entry, token age, `tx_hash`. `evm_address` on ULTRA only |
 | `rhc_trades` | `/api/v1/rhc/trades` | PRO+ | DEX trade tape — Uniswap v2/v3/v4 swaps with the effective `trader_eoa` + MEV fields |
+| `rhc_lp_events` | `/api/v1/rhc/lp-events` | PRO+ | Liquidity **removals** feed (the rug signal) — v2/v3 `Burn` + v4 negative `ModifyLiquidity`, raw uint256 strings, `provider_is_token_deployer`. Removals only, adds are not persisted |
 | `rhc_tokens` | `/api/v1/rhc/tokens` | PRO+ | Token discovery — MC, liquidity, peak MC + drawdown, launchpad, deployer tier |
+| `rhc_equities` | `/api/v1/rhc/equities` | BASIC | Tokenized stocks & ETFs (NVDA, SPY, AAPL…) — live price/MC/liquidity + 24h trades / ETH volume / buyer-seller split. Identity = issuer **beacon** `0xe10b…151b00`, never the name |
 | `rhc_token` | `/api/v1/rhc/tokens/{address}` | BASIC | Token snapshot — price/MC/FDV, deployer block, KOL activity, pools |
 | `rhc_token_batch` | `POST /api/v1/rhc/token/batch` | BASIC | **Up to 50 tokens in one call** — price/MC/FDV, peak MC, deployer reputation. Unknown addresses echo back as `found: false` |
 | `rhc_token_candles` | `/api/v1/rhc/tokens/{address}/candles` | PRO+ | 1-minute OHLC candles — price + MC OHLC, volume with buy/sell split |
@@ -84,6 +88,16 @@ Each tool maps 1:1 to a Robinhood Chain v1 API route. **40 are reads** (GET, plu
 | `rhc_deployer_alerts` | `/api/v1/rhc/deployer-hunter/alerts` | BASIC | Deployer alerts — **tradability-filtered by default**, tier resolved at read time (`tier_at_alert`, `tier_is_stale`) |
 | `rhc_recent_bonds` | `/api/v1/rhc/deployer-hunter/recent-bonds` | BASIC | Tokens that just crossed the $40K peak-MC graduation milestone, newest peak first |
 | `rhc_alpha_wallets` | `/api/v1/rhc/alpha-wallets` | PRO+ | Smart-money wallets — `net_eth`, `win_rate`, `memecoin_share`, `likely_bot` |
+| `rhc_wallet` | `/api/v1/rhc/wallet/{address}` | PRO+ | Wallet 90-day profile — ETH PnL, per-token breakdown, reputation flags (shares one snapshot cache with pnl/positions) |
+| `rhc_wallet_pnl` | `/api/v1/rhc/wallet/{address}/pnl` | PRO+ | FIFO cost-basis PnL over the rolling 90-day window — curve, closed + open positions; `cost_basis_observable_from` |
+| `rhc_wallet_positions` | `/api/v1/rhc/wallet/{address}/positions` | PRO+ | Open positions marked to market — check `liquidity_basis` |
+| `rhc_wallet_trades` | `/api/v1/rhc/wallet/{address}/trades` | PRO+ | One wallet's trade tape, keyset-paginated by wallet (not token) |
+| `rhc_wallet_tracker_list` | `/api/v1/rhc/wallet-tracker/watchlist` | PRO+ | List your RHC watchlist — quota is per chain |
+| ✍️ `rhc_wallet_tracker_add` | `POST /api/v1/rhc/wallet-tracker/watchlist` | PRO+ | Track a wallet (address lowercased on write); 409 if already tracked, 403 at cap |
+| 🗑️ `rhc_wallet_tracker_remove` | `DELETE /api/v1/rhc/wallet-tracker/watchlist/{address}` | PRO+ | Untrack a wallet, freeing a quota slot |
+| ✍️ `rhc_wallet_tracker_relabel` | `PATCH /api/v1/rhc/wallet-tracker/watchlist/{address}` | PRO+ | Relabel a tracked wallet; `null` clears the label |
+| `rhc_wallet_tracker_trades` | `/api/v1/rhc/wallet-tracker/trades` | PRO+ | Merged trade feed across your tracked wallets, label-tagged |
+| `rhc_wallet_tracker_summary` | `/api/v1/rhc/wallet-tracker/summary` | PRO+ | Per-wallet rollup from `rhc_trades` — full history, not capture-log scoped |
 | `rhc_copytrade_list` | `/api/v1/rhc/copytrade/subscriptions` | PRO+ | List your copy-trade rules |
 | `rhc_copytrade_get` | `/api/v1/rhc/copytrade/subscriptions/{id}` | PRO+ | One copy-trade rule by numeric id |
 | `rhc_copytrade_signals` | `/api/v1/rhc/copytrade/signals` | PRO+ | Fire history, **7-day** retention — the catch-up path after a missed webhook |
