@@ -13,6 +13,8 @@ Give Claude, Cursor, or any [MCP](https://modelcontextprotocol.io/) client direc
 
 RHC coverage is **bundled into every tier at no extra cost**. Get a free API key (200 req/day, no card) at [madeonsol.com/pricing](https://madeonsol.com/pricing).
 
+> **0.8.1** — version alignment with the wider RHC SDK release: WebSocket stream tokens (`POST /api/v1/stream/token`) **never expire** since 2026-08-27 — the same token comes back on every call, `expires_at` / `next_refresh_at` are always `null`, and only an explicit `{"rotate": true}` replaces one. This MCP server exposes REST tools, not WebSocket channels, and has no stream-token tool, so no tool behavior changed.
+
 > **0.5.0** — version alignment with the wider RHC SDK release: the stream channel names were corrected in the TS/Python/Rust SDKs (the RHC firehose channel is `rhc:dex_trades`; the server accepts `rhc:trades` only as a deprecated alias of it). This MCP server exposes REST tools, not WebSocket channels, so no tool behavior changed — the `rhc_trades` tool (the `GET /rhc/trades` tape) is unaffected.
 
 > **Key-mode only.** Authenticate with an `msk_` Bearer API key (`MADEONSOL_API_KEY`). Robinhood Chain does have a keyless x402 pay-per-call rail — a deliberately narrow 6-endpoint subset, documented at [madeonsol.com/robinhood/x402](https://madeonsol.com/robinhood/x402) — but it is not part of this server.
