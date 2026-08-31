@@ -1,8 +1,8 @@
 {
   "name": "mcp-server-robinhood-chain",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "mcpName": "io.github.MadeOnSol/robinhood-chain",
-  "description": "MCP server for the MadeOnSol Robinhood Chain (chain id 4663) API — EVM-native on-chain trading intelligence for AI agents. Live KOL trades, DEX trade tape, token discovery/bundles/candles, deployer reputation, and smart-money wallets. Use from Claude, Cursor, or any MCP client. Free tier 200 req/day.",
+  "description": "MCP server for the MadeOnSol Robinhood Chain (chain id 4663) API — EVM-native on-chain trading intelligence for AI agents. KOL trades (real-time on paid keys; 5-min delay on free), DEX trade tape, token discovery/bundles/candles, deployer reputation, and smart-money wallets. Use from Claude, Cursor, or any MCP client. Free tier 200 req/day.",
   "type": "module",
   "bin": {
     "mcp-server-robinhood-chain": "dist/index.js"

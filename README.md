@@ -58,7 +58,7 @@ Each tool maps 1:1 to a Robinhood Chain v1 API route. **49 are reads** (GET, plu
 
 | Tool | Route | Tier | Description |
 |---|---|---|---|
-| `rhc_kol_feed` | `/api/v1/rhc/kol/feed` | BASIC | Real-time KOL trade feed with MC/peak enrichment and `mc_multiple_since_trade` |
+| `rhc_kol_feed` | `/api/v1/rhc/kol/feed` | BASIC | KOL trade feed with MC/peak enrichment and `mc_multiple_since_trade` (real-time on PRO+; 5-min delay on free keys) |
 | `rhc_kol_leaderboard` | `/api/v1/rhc/kol/leaderboard` | BASIC | KOLs ranked by trade count then net ETH flow (`24h`/`7d`/`30d`) |
 | `rhc_kol_hot_tokens` | `/api/v1/rhc/kol/hot-tokens` | BASIC | Consensus tokens bought by 2+ distinct KOLs in the window |
 | `rhc_kol_profile` | `/api/v1/rhc/kol/{wallet}` | BASIC | Single KOL profile — stats over last 200 trades + 50 recent |

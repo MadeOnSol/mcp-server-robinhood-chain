@@ -58,7 +58,7 @@ function initAuth() {
   }
   console.error(
     "\n[rhc-mcp] No MADEONSOL_API_KEY set — every tool call will fail.\n" +
-    "  → Get a free API key (200 req/day, no card) at https://madeonsol.com/pricing\n" +
+    "  → Get a free API key (200 req/day, no card; live feeds 5-min delayed — paid keys are real-time) at https://madeonsol.com/pricing\n" +
     "  → Robinhood Chain coverage is bundled into every tier at no extra cost.\n",
   );
 }
@@ -1277,7 +1277,7 @@ async function main() {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           name: "robinhood-chain",
-          description: "Robinhood Chain (chain id 4663) EVM-native on-chain trading intelligence — real-time KOL trades, the DEX trade tape, token discovery / bundles / candles, deployer reputation, and smart-money wallets. Auth via msk_ API key. Free tier 200 requests/day.",
+          description: "Robinhood Chain (chain id 4663) EVM-native on-chain trading intelligence — KOL trades (real-time on paid keys; 5-min delay on free), the DEX trade tape, token discovery / bundles / candles, deployer reputation, and smart-money wallets. Auth via msk_ API key. Free tier 200 requests/day.",
           version: VERSION,
           tools: TOOL_CARDS,
           homepage: "https://madeonsol.com/robinhood",
