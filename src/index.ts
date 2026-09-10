@@ -451,6 +451,19 @@ function registerTools(server: McpServer) {
   );
 
   server.tool(
+    "rhc_token_early_buyers",
+    "First buyers of a Robinhood Chain token, ranked, with still-holding status. Previously only readable as a count inside a wallet profile ('this wallet was an early buyer of N tokens') — this is the per-token ranked list. Added 2026-09-10. Tier: PRO+.",
+    {
+      address: z.string().describe("Token address (0x, 40 hex)"),
+      limit: z.number().int().min(1).max(20).optional().describe("Rows, capped at 20 (default 20)"),
+    },
+    readOnly,
+    async ({ address, limit }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/early-buyers`, { limit }) }],
+    })
+  );
+
+  server.tool(
     "rhc_token_flow",
     "Net buy/sell flow on a Robinhood Chain token split by mutually-exclusive trader cohort — who is accumulating and who is distributing. SIGN CONVENTION: net_eth = sell MINUS buy, so a POSITIVE net_eth means that cohort DISTRIBUTED (took ETH out) and a NEGATIVE value means it ACCUMULATED. Do not invert this. Cohorts are assigned by a priority ladder and each trader lands in exactly one: kol, bot, dump_cluster, early_buyer, unprofiled, smart_money, retail. smart_money is DERIVED (win_rate >= 0.5 and net positive), not a stored label. unprofiled is a real answer, not missing data — that trader has not met the reputation thresholds yet. There is deliberately NO fresh_wallet cohort because Robinhood Chain stores no wallet-level first-seen. Tier: PRO+.",
     {
@@ -1208,6 +1221,7 @@ const TOOL_CARDS = [
   { name: "rhc_token_batch_buyer_quality", description: "Early-buyer quality for up to 20 RHC tokens in one call (cap is 20, not 50)." },
   { name: "rhc_token_bundle", description: "RHC launch-bundle detection (same_block) + how much the cohort still holds." },
   { name: "rhc_token_top_traders", description: "Top traders of an RHC token by REALIZED eth (sell−buy, not PnL) + reputation. PRO+." },
+  { name: "rhc_token_early_buyers", description: "First buyers of an RHC token, ranked, with still-holding status. PRO+." },
   { name: "rhc_token_flow", description: "RHC net buy/sell by cohort; net_eth = sell−buy so positive = distributing. PRO+." },
   { name: "rhc_token_peak_history", description: "RHC peak MC + drawdown + high-water curve; recorded vs observed peak. PRO+." },
   { name: "rhc_token_risk", description: "RHC EVM-native risk computed live — proxy, LP custody, live honeypot sell-sim. PRO+." },
