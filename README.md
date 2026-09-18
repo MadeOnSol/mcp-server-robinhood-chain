@@ -17,9 +17,15 @@ RHC coverage is **bundled into every tier at no extra cost**. Get a free API key
 
 > **0.5.0** — version alignment with the wider RHC SDK release: the stream channel names were corrected in the TS/Python/Rust SDKs (the RHC firehose channel is `rhc:dex_trades`; the server accepts `rhc:trades` only as a deprecated alias of it). This MCP server exposes REST tools, not WebSocket channels, so no tool behavior changed — the `rhc_trades` tool (the `GET /rhc/trades` tape) is unaffected.
 
-> **Key-mode only.** Authenticate with an `msk_` Bearer API key (`MADEONSOL_API_KEY`). Robinhood Chain does have a keyless x402 pay-per-call rail — a deliberately narrow 6-endpoint subset, documented at [madeonsol.com/robinhood/x402](https://madeonsol.com/robinhood/x402) — but it is not part of this server.
+> **Key-mode only.** Authenticate with an `msk_` Bearer API key (`MADEONSOL_API_KEY`). Robinhood Chain does have a keyless x402 pay-per-call rail — now 10 endpoints (grew from the original 6), documented at [madeonsol.com/robinhood/x402](https://madeonsol.com/robinhood/x402) — but it is not part of this server.
 
-> **New in 0.9.0 — early buyers (65 tools total).** `rhc_token_early_buyers` (`GET /rhc/tokens/{address}/early-buyers`, PRO+) — first buyers of a token, ranked, with still-holding status. Found by an internal agentic-infra coverage audit as the one RHC capability unreachable from every agent surface, not just this one.
+> **New in 0.11.0 — BREAKING: HTTP mode now requires a separate token (security fix, SEC-02).** If you run this server with `MCP_TRANSPORT=http`, you must now also set `MCP_HTTP_TOKEN` (a random secret you generate) and send it as `Authorization: Bearer <token>` on **every** request, including `GET /health` and the server-card endpoint — previously, anything that could reach the bound port could call every tool using the operator's own credentials with no authentication at all. HTTP mode is now hard-restricted to literal loopback (`127.0.0.1` / `::1`), rejects `Origin`/`X-Forwarded-*` headers and duplicate `Authorization`/`Host` headers outright, exposes only `POST /mcp` plus the two GET routes, and refuses to start if a wallet/payment credential is configured. **If you use the default `stdio` transport (Claude Desktop, Cursor, most MCP clients), nothing changes — no action needed.** This is a single shared-operator-token fix, not a new multi-user or OAuth system. Full writeup: `docs/audit/SEC02_PRIVATE_HTTP_MCP.md`.
+>
+> **New in 0.10.1 — the server now reports MCP `instructions`.** The `initialize` response's `instructions` field (operational guidance for the calling agent — distinct from this README/package description) was never set; directories that introspect the live server (Glama) reported "no recorded MCP instructions." No new tools; still 68 total.
+>
+> **New in 0.10.0 — token locks & vesting (68 tools total).** Three new tools, shipped 2026-09-15 and only now documented here (the code shipped without a version bump or a changelog line, so this README kept saying 65 while the server had actually registered 68 — checked going forward by `scripts/verify-mcp-tool-counts.mjs` in the main repo). `rhc_token_locks` (**PRO+**) is the newest-first feed of lock/vesting contracts created across every token — PinkLock-compatible, HoodLock, Team Finance-compatible, Titan, UNCX-compatible LP lockers and Sablier v4, decoded from our own node. `rhc_token_lock_summary` (**PRO+**) rolls every lock on ONE token into a live "did the team lock, how much, until when, can they cancel" view. `rhc_token_unlocks` (**PRO+**) lists upcoming unlock events chain-wide inside a 1h–90d window. All three are **create-only**: withdrawals and cancels are not tracked by any RHC locker's on-chain events, so `withdrawn` is always `null` (unknown), never `0` — never present a lock as "still held" beyond what the schedule says.
+>
+> **New in 0.9.0 — early buyers (65 tools total at the time).** `rhc_token_early_buyers` (`GET /rhc/tokens/{address}/early-buyers`, PRO+) — first buyers of a token, ranked, with still-holding status. Found by an internal agentic-infra coverage audit as the one RHC capability unreachable from every agent surface, not just this one.
 >
 > **New in 0.8.0 — tokenized equities + the liquidity-removals feed.** Two new tools. `rhc_equities` (`GET /rhc/equities`, **BASIC**) lists every official Robinhood tokenized stock and ETF (NVDA, SPY, AAPL, …) with live price / MC / liquidity and 24h trades, ETH volume and buyer-seller split, sortable by `volume` / `trades` / `market_cap` / `last_trade` / `symbol`, filterable by exact `symbol` or substring `q`. **Identity is the issuer beacon, never the name**: a token is listed only if its contract is an EIP-1967 beacon proxy on Robinhood's issuer beacon `0xe10b6f6b…151b00`, read from our own node — on ship day there were 20 fake "GameStop • Robinhood Token" contracts and 8 fake NVDAs with the exact official suffix, and none of them appear. `rhc_lp_events` (`GET /rhc/lp-events`, **PRO+**) is the rug signal: Uniswap v2/v3 `Burn` and v4 `ModifyLiquidity` with a negative delta on tracked pools, from our node's log subscription, filterable by `token` / `pool` / `provider` / `dex` and cursor-paginated on `next_before`. **Removals only** — adds are not persisted (the response's `coverage` block says `adds_persisted: false`), amounts are raw uint256 **strings**, v4 rows carry `liquidity` only, and `provider_is_token_deployer` is the classic rug tell. Data since 2026-08-05.
 
@@ -50,7 +56,25 @@ Then ask your agent things like *"What are tracked KOLs buying on Robinhood Chai
 ### Transports
 
 - **stdio** (default) — for local clients (Claude Desktop, Cursor, Claude Code).
-- **http** — set `MCP_TRANSPORT=http` (+ optional `PORT`, default 3100) for hosted environments (Smithery, etc.). Exposes `/health` and `/.well-known/mcp/server-card.json`.
+- **http** — optional private, API-key-only adapter for one trusted operator on loopback. See the access requirements below; public hosting is unsupported.
+
+
+## Private HTTP transport (SEC-02)
+
+Stdio remains the default for Claude Desktop, Cursor and other local MCP clients. HTTP now requires an explicit private-operator configuration; previously unauthenticated HTTP launch settings will fail closed.
+
+1. Set `MADEONSOL_API_KEY` to the operator's `msk_` key.
+2. Generate a separate random access token, for example `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"`, and store it as `MCP_HTTP_TOKEN`. Do not reuse the upstream API key or put either credential in a URL.
+3. Set `MCP_TRANSPORT=http`, `HOST=127.0.0.1` (default, or `::1`) and optionally `PORT` (default `3100`). Non-loopback bindings, missing credentials and any `SVM_PRIVATE_KEY` or `RHC_PAYER_KEY` are refused before startup. Solana wallet/x402 mode remains available through stdio.
+4. Connect to `http://127.0.0.1:3100/mcp` with `Authorization: Bearer <MCP_HTTP_TOKEN>` on **every request**, plus the normal MCP `Content-Type` and `Accept` headers. Use stdio if the client cannot attach headers. The local token is checked by the MCP adapter; only `MADEONSOL_API_KEY` is sent upstream.
+
+Only `POST /mcp`, `GET /health` and `GET /.well-known/mcp/server-card.json` are exposed, all authenticated. `/` and arbitrary paths are no longer MCP endpoints. The adapter is stateless: it does not issue session IDs, rejects supplied `Mcp-Session-Id`, and returns 405 for GET/DELETE on `/mcp`. Host must be the selected loopback literal with its port, or `localhost` with that exact port. Browser Origin headers, forwarded/proxy headers and cross-origin requests are rejected; no CORS access is granted.
+
+Limits: 256 KiB uncompressed JSON bodies, 8 KiB headers, a 10-second body-upload deadline, and 16 active authenticated requests. Oversized or malformed inputs are rejected before tool dispatch. This is not an overall tool-execution deadline; an upstream action already submitted may continue after a disconnect.
+
+Everyone holding the local token acts as the **same operator**, including access to that operator's mutation tools. This is not a multi-user/OAuth server: do not put it behind a public proxy, share it with untrusted users or expose a funded signer. Separate users require isolated processes/credentials or a future transport that authenticates each principal and maps their own credentials. Restart with a new `MCP_HTTP_TOKEN` to rotate access.
+
+The Docker image uses the same loopback restriction and requires both environment credentials. Its healthcheck authenticates without putting the token in the URL. It does not support a publicly published Docker port; use stdio or a client in the same trusted network namespace.
 
 ## Tools — all 64 Robinhood Chain routes
 

@@ -8,8 +8,8 @@
  *
  * Key-mode only: authenticate with an `msk_` Bearer API key (get a free key at
  * https://madeonsol.com/pricing — RHC coverage is bundled into every tier). The
- * x402 pay-per-call rail is live on Robinhood Chain too (6 keyless endpoints, discovery at /api/x402/rhc), but is not part of this server. All 64
- * tools map 1:1 to /api/v1/rhc/… routes: 49 reads (GET, plus two POST batch
+ * x402 pay-per-call rail is live on Robinhood Chain too (6 keyless endpoints, discovery at /api/x402/rhc), but is not part of this server. All 68
+ * tools map 1:1 to /api/v1/rhc/… routes: 53 reads (GET, plus two POST batch
  * routes that are POST only because the address list is too long for a query
  * string) and 15 tools that genuinely mutate (POST / PATCH / DELETE on
  * copy-trade, price-alert, coordination and first-touch rules, plus the three
@@ -20,11 +20,15 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { VERSION } from "./version.js";
-import { createServer } from "node:http";
+import { createPrivateHttpServer, readHttpConfig } from "./http-security.js";
+
+// MCP `initialize` response `instructions` field — see the matching comment
+// in mcp-server-madeonsol/src/index.ts for why this was previously unset.
+const SERVER_INSTRUCTIONS =
+  "Real-time Robinhood Chain (EVM, chain id 4663) on-chain intelligence: KOL trades, deployer reputation, token risk/holders, wallet PnL, and the all-DEX trade tape — same data model as the Solana server, EVM-native. Auth is a msk_ API key only (MADEONSOL_API_KEY env var, madeonsol.com/pricing); this server does not do keyless x402 — for that, use the separate robinhood-chain-x402 package. Prefer a single-item lookup before a heavier call (PnL, risk, trade tape) on the same address/token. Free-tier live feeds are delayed 5 minutes; paid keys are real-time.";
 
 const BASE_URL = process.env.MADEONSOL_API_URL || "https://madeonsol.com";
 const MADEONSOL_API_KEY = process.env.MADEONSOL_API_KEY; // Native key from madeonsol.com/pricing
-const PORT = parseInt(process.env.PORT || "3100", 10);
 const MODE = process.env.MCP_TRANSPORT || "stdio"; // "stdio" or "http"
 
 export type AuthMode = "madeonsol" | "none";
@@ -302,6 +306,91 @@ function registerTools(server: McpServer) {
       if (dex) params.dex = dex;
       if (before) params.before = before;
       return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/lp-events", params) }] };
+    }
+  );
+
+
+  /* ── Token locks & vesting ── */
+
+  server.tool(
+    "rhc_token_locks",
+    "Robinhood Chain TOKEN LOCKS & VESTING feed — newest lock / vesting contracts CREATED on chain across all tokens, newest first, decoded from the locker contracts' own events on our own node (PinkLock-compatible, HoodLock + vesting, Team Finance-compatible, Titan Locker, UNCX-compatible LP lockers, Sablier Lockup v4). Each row carries the on-chain schedule (start_at / cliff_at / end_at, cliff_amount, tranche `schedule`) and a LIVE derived view: locked_* (still locked right now), unlocked_*, next_unlock {at, kind cliff|final|tranche, amount}, status active|completed. `sender` is the depositor/creator — compare it with the token's deployer (rhc_token) to call a DEV LOCK; `recipient` is the beneficiary when different; cancelable_by_sender comes from Sablier's flag (null where the family does not say). Amounts are RAW base units as decimal STRINGS — never coerce to floats; ui/usd/pct are null when decimals or price are unknown. CREATE-ONLY TAPE: withdrawals and cancels are NOT tracked (no RHC locker publishes a verified release event) — `withdrawn` is null (unknown), never 0, and coverage.withdrawals_tracked is false; never present a lock as 'still held' beyond what the schedule says. LP locks (RHC launchpads auto-lock LP on every launch — noise) are excluded unless subject='lp'|'all', carry pair/liquidity units and never claim usd/pct. Cursor: pass pagination.next_since back as `since` to poll for newer, next_before as `before` to page back. Tier: PRO+ (403 on BASIC).",
+    {
+      limit: z.number().int().min(1).max(100).default(50).describe("Number of locks (1-100)"),
+      since: z.string().optional().describe("ISO instant — only locks created after it (poll cursor = pagination.next_since)"),
+      before: z.string().optional().describe("ISO instant — only locks created before it (page back = pagination.next_before)"),
+      token: z.string().optional().describe("Filter to one token address (0x, 40 hex)"),
+      sender: z.string().optional().describe("Depositor / creator wallet (0x, 40 hex)"),
+      recipient: z.string().optional().describe("Beneficiary wallet (0x, 40 hex)"),
+      locker: z.string().optional().describe("Locker contract address (0x, 40 hex)"),
+      family: z.string().optional().describe("pinklock | teamfinance | teamfinance-nft | uncx-v2-lp | uncx-v3-lp | uncx-vesting | vesting-fork | goplus | titan | titan-position | titan-vesting | hoodlock | hoodlock-vesting | sablier"),
+      kind: z.enum(["lock", "vesting"]).optional(),
+      subject: z.enum(["token", "lp", "all"]).optional().describe("token (default) excludes LP locks; lp = only LP locks; all = both"),
+      status: z.enum(["active", "completed"]).optional(),
+      min_usd: z.number().min(0).optional().describe("Post-filter on the deposited amount in USD"),
+      min_pct_of_supply: z.number().min(0).max(100).optional().describe("Post-filter on the deposited amount as % of supply"),
+    },
+    readOnly,
+    async ({ limit, since, before, token, sender, recipient, locker, family, kind, subject, status, min_usd, min_pct_of_supply }) => {
+      const params: Record<string, string | number> = { limit };
+      if (since) params.since = since;
+      if (before) params.before = before;
+      if (token) params.token = token;
+      if (sender) params.sender = sender;
+      if (recipient) params.recipient = recipient;
+      if (locker) params.locker = locker;
+      if (family) params.family = family;
+      if (kind) params.kind = kind;
+      if (subject) params.subject = subject;
+      if (status) params.status = status;
+      if (min_usd !== undefined) params.min_usd = min_usd;
+      if (min_pct_of_supply !== undefined) params.min_pct_of_supply = min_pct_of_supply;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/tokens/locks", params) }] };
+    }
+  );
+
+  server.tool(
+    "rhc_token_lock_summary",
+    "Every lock / vesting contract on ONE Robinhood Chain token with a live summary — 'did the team lock, how much, until when, can they cancel'. summary covers the token-subject rows: locked / deposited (raw + ui + usd + % of supply), unlocking_7d_* / unlocking_30d_* (forward schedule), nearest next_unlock, active_cancelable_by_sender (funds are locked against the RECIPIENT, not the locker, when the sender can cancel), counts by family / kind, distinct depositing wallets; LP locks on the token's pools are counted APART (lp_lock_count) because their amounts are pair units. Rows active-first, largest locked first. token.facts_resolved:false means decimals are unknown and every ui/usd/pct is null — say so rather than reading 0. Same create-only caveat as rhc_token_locks (withdrawals not tracked). Tier: PRO+.",
+    {
+      address: z.string().describe("Token address (0x, 40 hex)"),
+      status: z.enum(["active", "completed"]).optional(),
+      family: z.string().optional(),
+      subject: z.enum(["token", "lp", "all"]).optional().describe("Default all"),
+      limit: z.number().int().min(1).max(500).default(200).describe("Rows returned (the summary always covers every row)"),
+    },
+    readOnly,
+    async ({ address, status, family, subject, limit }) => {
+      const params: Record<string, string | number> = { limit };
+      if (status) params.status = status;
+      if (family) params.family = family;
+      if (subject) params.subject = subject;
+      return { content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/locks`, params) }] };
+    }
+  );
+
+  server.tool(
+    "rhc_token_unlocks",
+    "Upcoming unlock EVENTS across all active Robinhood Chain lock / vesting contracts — which tokens have supply hitting the market inside the window, how much, from whose lock. One entry per active contract = its NEXT cliff / tranche / final unlock inside within=1h..90d, with amount_* (the event, raw / ui / usd / % of supply) and window_amount_* (that contract's total release over the whole window). Linear per-second streams contribute cliff / final events only. Token subject only (LP excluded). Prices implying a market cap above $100B are treated as phantom → usd null. Tier: PRO+.",
+    {
+      within: z.enum(["1h", "6h", "24h", "3d", "7d", "14d", "30d", "90d"]).default("7d"),
+      token: z.string().optional().describe("Filter to one token address (0x, 40 hex)"),
+      family: z.string().optional(),
+      kind: z.enum(["lock", "vesting"]).optional(),
+      min_usd: z.number().min(0).optional().describe("On the next-event amount"),
+      min_pct_of_supply: z.number().min(0).max(100).optional().describe("On the next-event amount"),
+      sort: z.enum(["soonest", "largest_usd", "largest_pct"]).default("soonest"),
+      limit: z.number().int().min(1).max(200).default(50),
+    },
+    readOnly,
+    async ({ within, token, family, kind, min_usd, min_pct_of_supply, sort, limit }) => {
+      const params: Record<string, string | number> = { within, sort, limit };
+      if (token) params.token = token;
+      if (family) params.family = family;
+      if (kind) params.kind = kind;
+      if (min_usd !== undefined) params.min_usd = min_usd;
+      if (min_pct_of_supply !== undefined) params.min_pct_of_supply = min_pct_of_supply;
+      return { content: [{ type: "text" as const, text: await query("/api/v1/rhc/tokens/unlocks", params) }] };
     }
   );
 
@@ -1211,6 +1300,9 @@ const TOOL_CARDS = [
   { name: "rhc_kol_first_touches", description: "RHC earliest KOL buy per token — the discovery signal, with MC at entry." },
   { name: "rhc_trades", description: "RHC DEX trade tape — Uniswap v2/v3/v4 swaps with trader_eoa + MEV fields. PRO+." },
   { name: "rhc_lp_events", description: "RHC liquidity REMOVALS feed (rug signal) — v2/v3 Burn + v4 negative ModifyLiquidity, raw uint256 strings, removals only. PRO+." },
+  { name: "rhc_token_locks", description: "RHC token locks & vesting feed — newest lock contracts across all tokens, on-chain schedule + live locked/next_unlock; sender = depositor (dev-lock key). Create-only (withdrawals not tracked). PRO+." },
+  { name: "rhc_token_lock_summary", description: "Every lock/vesting contract on one RHC token + summary: locked/deposited, unlocking_7d/30d, next_unlock, active_cancelable_by_sender; LP locks counted apart. PRO+." },
+  { name: "rhc_token_unlocks", description: "Upcoming RHC unlock EVENTS (cliff | final | tranche) inside 1h..90d with event + window amounts. PRO+." },
   { name: "rhc_tokens", description: "RHC token discovery — MC, liquidity, peak MC, launchpad, deployer tier. PRO+." },
   { name: "rhc_equities", description: "RHC tokenized stocks & ETFs (NVDA, SPY, AAPL…) — beacon-verified identity, live price/MC/liquidity + 24h trades/volume/buyer-seller split. BASIC." },
   { name: "rhc_token", description: "RHC token snapshot — price/MC/FDV, deployer block, KOL activity, pools." },
@@ -1271,14 +1363,12 @@ const TOOL_CARDS = [
 ];
 
 async function main() {
+  const httpConfig = MODE === "http" ? readHttpConfig() : undefined;
   initAuth();
 
   if (MODE === "http") {
-    // HTTP transport for hosted environments (Smithery, etc.)
-    const httpServer = createServer();
-    const transports = new Map<string, StreamableHTTPServerTransport>();
-
-    httpServer.on("request", async (req, res) => {
+    // Configuration is validated before authentication can initialize a signer.
+    const httpServer = createPrivateHttpServer(httpConfig!, async (req, res, body) => {
       // Health check
       if (req.method === "GET" && req.url === "/health") {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -1300,43 +1390,32 @@ async function main() {
         return;
       }
 
-      // MCP endpoint
-      const sessionId = req.headers["mcp-session-id"] as string | undefined;
-      if (req.method === "POST") {
-        let transport = sessionId ? transports.get(sessionId) : undefined;
-        if (!transport) {
-          transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-          const server = new McpServer({ name: "robinhood-chain", version: VERSION });
-          registerTools(server);
-          await server.connect(transport);
-        }
-        await transport.handleRequest(req, res);
-        return;
-      }
-
-      if (req.method === "GET" && sessionId) {
-        const transport = transports.get(sessionId);
-        if (transport) { await transport.handleRequest(req, res); return; }
-      }
-
-      if (req.method === "DELETE" && sessionId) {
-        const transport = transports.get(sessionId);
-        if (transport) { await transport.handleRequest(req, res); transports.delete(sessionId); return; }
-      }
-
-      res.writeHead(404);
-      res.end("Not found");
+      // One server/transport per authenticated stateless POST /mcp.
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        enableJsonResponse: true,
+        enableDnsRebindingProtection: true,
+        allowedHosts: httpConfig!.allowedHosts,
+        allowedOrigins: [],
+      });
+      const server = new McpServer({ name: "robinhood-chain", version: VERSION }, { instructions: SERVER_INSTRUCTIONS });
+      res.once("close", () => { void server.close().catch(() => {}); });
+      registerTools(server);
+      await server.connect(transport);
+      if (res.destroyed) { await server.close(); return; }
+      await transport.handleRequest(req, res, body);
     });
 
-    // Bind to 127.0.0.1 only — defense in depth. Override with HOST=0.0.0.0 for
-    // hosted environments behind a separate reverse proxy.
-    const HOST = process.env.HOST || "127.0.0.1";
-    httpServer.listen(PORT, HOST, () => {
-      console.error(`[rhc-mcp] HTTP server listening on ${HOST}:${PORT}`);
+    httpServer.on("error", () => {
+      console.error("[rhc-mcp] HTTP listener failed");
+      process.exitCode = 1;
+    });
+    httpServer.listen(httpConfig!.port, httpConfig!.host, () => {
+      console.error(`[rhc-mcp] HTTP server listening on ${httpConfig!.host}:${httpConfig!.port}/mcp (private operator only)`);
     });
   } else {
     // Stdio transport for local use (Claude Desktop, Cursor, Claude Code)
-    const server = new McpServer({ name: "robinhood-chain", version: VERSION });
+    const server = new McpServer({ name: "robinhood-chain", version: VERSION }, { instructions: SERVER_INSTRUCTIONS });
     registerTools(server);
     const transport = new StdioServerTransport();
     await server.connect(transport);
@@ -1346,5 +1425,8 @@ async function main() {
 // Only auto-run when executed as a program (CLI / spawned process), not when the
 // module is imported by a test for its exported pure helpers.
 if (process.env.RHC_MCP_NO_AUTORUN !== "1") {
-  main().catch(console.error);
+  main().catch(error => {
+    console.error(error instanceof Error ? error.message : "MCP startup failed");
+    process.exitCode = 1;
+  });
 }
