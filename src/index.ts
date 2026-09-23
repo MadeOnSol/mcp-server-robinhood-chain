@@ -943,7 +943,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_copytrade_list",
-    "List your Robinhood Chain copy-trade rules. Each rule mirrors 1+ source EVM wallets and emits a signal (webhook and/or the rhc:copytrade:signals WS channel) when they trade on chain 4663. Returns id, name, source_wallets, min_trade_eth, only_action, sizing_mode, sizing_amount, delivery_mode, webhook_url, is_active. Rule caps are PER CHAIN and do not consume the Solana copy-trade budget: PRO 3 rules / 5 wallets each, ULTRA 20 / 50, BUSINESS 100 / 250. Tier: PRO+.",
+    "List your Robinhood Chain copy-trade rules. Each rule mirrors 1+ TRACKED KOL wallets (the set behind /rhc/kol/wallets) and emits a signal (webhook and/or the rhc:copytrade:signals WS channel) when they trade on chain 4663. Returns id, name, source_wallets, min_trade_eth, only_action, sizing_mode, sizing_amount, delivery_mode, webhook_url, is_active. Rule caps are PER CHAIN and do not consume the Solana copy-trade budget: PRO 3 rules / 5 wallets each, ULTRA 20 / 50, BUSINESS 100 / 250. Tier: PRO+.",
     {},
     readOnly,
     async () => ({
@@ -953,7 +953,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_copytrade_create",
-    "CREATE a Robinhood Chain copy-trade rule (POST — this writes and consumes quota; do not call it to explore). Amounts are ETH, not SOL. IMPORTANT: RHC copy-trade has NO market-cap band (no min_mc_usd/max_mc_usd) — unlike the Solana engine — because the RHC KOL trade event carries no market cap, so the filter would either need a per-event DB lookup on a ~3.3M-trades/day chain or silently never match. Returns webhook_secret EXACTLY ONCE when delivery_mode includes 'webhook' — store it, payloads are HMAC-SHA256 over `<timestamp>.<body>` in X-MadeOnSol-Signature. Rule/wallet caps are PER CHAIN (PRO 3 rules / 5 wallets, ULTRA 20 / 50, BUSINESS 100 / 250); exceeding the rule cap returns 409. Tier: PRO+.",
+    "CREATE a Robinhood Chain copy-trade rule (POST — this writes and consumes quota; do not call it to explore). source_wallets must be TRACKED KOL wallets (the set behind /rhc/kol/wallets): any 0x address is accepted, but the engine only evaluates trades of tracked wallets, so read source_wallets_untracked + warnings (code untracked_source_wallets) on the response and tell the user which wallets can never fire. Amounts are ETH, not SOL. IMPORTANT: RHC copy-trade has NO market-cap band (no min_mc_usd/max_mc_usd) — unlike the Solana engine — because the RHC KOL trade event carries no market cap, so the filter would either need a per-event DB lookup on a ~3.3M-trades/day chain or silently never match. Returns webhook_secret EXACTLY ONCE when delivery_mode includes 'webhook' — store it, payloads are HMAC-SHA256 over `<timestamp>.<body>` in X-MadeOnSol-Signature. Rule/wallet caps are PER CHAIN (PRO 3 rules / 5 wallets, ULTRA 20 / 50, BUSINESS 100 / 250); exceeding the rule cap returns 409. Tier: PRO+.",
     {
       source_wallets: z.array(z.string()).min(1).max(250).describe("1-250 source EVM wallets to mirror (0x, 40 hex). Lowercased on write. Capped by tier: PRO 5, ULTRA 50, BUSINESS 250"),
       sizing_amount: z.number().positive().describe("Amount in ETH, interpreted by sizing_mode. Required"),
@@ -984,7 +984,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_copytrade_update",
-    "UPDATE a Robinhood Chain copy-trade rule (PATCH — this writes). Send only the fields you want changed; is_active:false pauses a rule without deleting it. source_wallets is a whole-list REPLACE and is re-checked against the tier wallet cap, so a PRO rule cannot be PATCHed past 5 wallets. Pass null for name or webhook_url to clear them. There is no market-cap band to set on RHC. Tier: PRO+.",
+    "UPDATE a Robinhood Chain copy-trade rule (PATCH — this writes). The response carries source_wallets_tracked / source_wallets_untracked + warnings: only tracked KOL wallets (/rhc/kol/wallets) can ever fire, so surface any untracked_source_wallets warning. Send only the fields you want changed; is_active:false pauses a rule without deleting it. source_wallets is a whole-list REPLACE and is re-checked against the tier wallet cap, so a PRO rule cannot be PATCHed past 5 wallets. Pass null for name or webhook_url to clear them. There is no market-cap band to set on RHC. Tier: PRO+.",
     {
       id: z.number().int().positive().describe("Copy-trade rule id (positive integer)"),
       name: z.string().min(1).max(64).nullable().optional().describe("New label, or null to clear"),
@@ -1033,11 +1033,12 @@ function registerTools(server: McpServer) {
   );
 
   /* ── Price alerts (PRO+) ──
-   * WRITES. Note the evaluation model differs from Solana: RHC is POLLED. */
+   * WRITES. Note the latency differs from Solana: RHC alerts are event-driven off
+   * rhc:dex_trade (since 2026-09-15) with table polls as safety nets, a few seconds, not sub-second. */
 
   server.tool(
     "rhc_price_alerts_list",
-    "List your Robinhood Chain price alerts — market-cap dip/recovery alerts on a single RHC token. Returns baseline_mc_usd (captured when the alert was created), drop_pct, recovery_pct, status, dip_low_mc_usd, dip_fired_at, delivery_mode, is_active, expires_at. TIMING: RHC alerts are POLLED on a ~15 SECOND interval against rhc_token_prices — they are NOT sub-second like the Solana price alerts, because the RHC price writer emits no pg_notify. Quota is PER CHAIN and does not consume the Solana price-alert budget: PRO 5 active, ULTRA 25, BUSINESS 125. Tier: PRO+.",
+    "List your Robinhood Chain price alerts — market-cap dip/recovery alerts on a single RHC token. Returns baseline_mc_usd (captured when the alert was created), drop_pct, recovery_pct, status, dip_low_mc_usd, dip_fired_at, delivery_mode, is_active, expires_at. TIMING: RHC alerts are evaluated as trades land on the chain trade feed (rhc:dex_trade), with price-table polls (5 s / 60 s) and a trade-tape replay as safety nets. They fire within a few seconds, NOT sub-second like the Solana price alerts. Quota is PER CHAIN and does not consume the Solana price-alert budget: PRO 5 active, ULTRA 25, BUSINESS 125. Tier: PRO+. For raw per-token price ticks instead of threshold alerts, a WebSocket client subscribes to the rhc:token_prices channel (address-scoped, filters.addresses, 25/100/250 per connection): one snapshot per address, then ticks at most every 250 ms, each with quality fresh | stale | unreliable and a reason.",
     {},
     readOnly,
     async () => ({
@@ -1047,7 +1048,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_price_alerts_create",
-    "CREATE a Robinhood Chain price alert (POST — this writes and consumes quota). Fires when the token's market cap falls drop_pct below the baseline captured AT CREATION TIME, and optionally again when it recovers recovery_pct off the dip low. TIMING: evaluation is a ~15 SECOND POLL of rhc_token_prices, not a live price loop — effective latency is that interval plus the token's own price-update cadence, so do NOT assume parity with Solana's sub-second alerts. The token must already be tracked with a market cap on RHC or the call returns 400. Returns webhook_secret EXACTLY ONCE when delivery_mode includes 'webhook'. Active-alert quota is PER CHAIN (PRO 5, ULTRA 25, BUSINESS 125); exceeding it returns 409. Tier: PRO+.",
+    "CREATE a Robinhood Chain price alert (POST — this writes and consumes quota). Fires when the token's market cap falls drop_pct below the baseline captured AT CREATION TIME, and optionally again when it recovers recovery_pct off the dip low. TIMING: evaluation is event-driven off the chain trade feed, with price-table polls and a trade-tape replay as safety nets. Latency is a few seconds (the chain trade flush is about 2 s), so do NOT assume parity with Solana's sub-second alerts. The response's evaluation block says mode 'event_driven'. The token must already be tracked with a market cap on RHC or the call returns 400. Returns webhook_secret EXACTLY ONCE when delivery_mode includes 'webhook'. Active-alert quota is PER CHAIN (PRO 5, ULTRA 25, BUSINESS 125); exceeding it returns 409. Tier: PRO+.",
     {
       token_address: z.string().describe("RHC token address (0x, 40 hex). Must be a token we already price"),
       drop_pct: z.number().min(0.01).max(99.99).describe("Percent drop from the creation-time baseline MC that fires the dip (0.01-99.99)"),
@@ -1104,7 +1105,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_price_alerts_events",
-    "Fire history for your Robinhood Chain price alerts — the catch-up path after a missed webhook or a dropped WS connection. Each event carries event_type ('dip' or 'recovery'), fired_at, token_address, baseline_mc_usd, current_mc_usd, drop_pct_actual, dip_low_mc_usd, recovery_pct_actual and delivery status. Retained 30 DAYS, newest first. Because evaluation is a ~15s poll, fired_at is the poll tick that observed the move, not the exact on-chain moment. Read-only. Tier: PRO+.",
+    "Fire history for your Robinhood Chain price alerts — the catch-up path after a missed webhook or a dropped WS connection. Each event carries event_type ('dip' or 'recovery'), fired_at, token_address, baseline_mc_usd, current_mc_usd, drop_pct_actual, dip_low_mc_usd, recovery_pct_actual and delivery status. Retained 30 DAYS, newest first. fired_at is when the evaluator observed the move (a few seconds after the trade), not the exact on-chain moment. Read-only. Tier: PRO+.",
     {
       limit: z.number().int().min(1).max(500).default(50).describe("Number of events (1-500, default 50)"),
       alert_id: z.number().int().positive().optional().describe("Filter to one of your alerts (404 if not yours)"),
@@ -1344,8 +1345,8 @@ const TOOL_CARDS = [
   { name: "rhc_copytrade_update", description: "WRITES — patch an RHC copy-trade rule; source_wallets is a replace. PRO+." },
   { name: "rhc_copytrade_delete", description: "DESTRUCTIVE — permanently delete an RHC copy-trade rule. PRO+." },
   { name: "rhc_copytrade_signals", description: "RHC copy-trade fire history (7-day catch-up feed). PRO+." },
-  { name: "rhc_price_alerts_list", description: "List RHC price alerts — ~15s polled, not sub-second. PRO+." },
-  { name: "rhc_price_alerts_create", description: "WRITES — create an RHC MC dip/recovery alert (~15s poll). PRO+." },
+  { name: "rhc_price_alerts_list", description: "List RHC price alerts (event-driven, a few seconds, not sub-second). PRO+." },
+  { name: "rhc_price_alerts_create", description: "WRITES: create an RHC MC dip/recovery alert (event-driven, a few seconds). PRO+." },
   { name: "rhc_price_alerts_get", description: "Get one RHC price alert by id, with its captured baseline MC. PRO+." },
   { name: "rhc_price_alerts_update", description: "WRITES — patch an RHC price alert; thresholds are immutable. PRO+." },
   { name: "rhc_price_alerts_delete", description: "DESTRUCTIVE — permanently delete an RHC price alert. PRO+." },

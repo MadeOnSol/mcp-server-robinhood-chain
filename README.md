@@ -126,8 +126,8 @@ Each tool maps 1:1 to a Robinhood Chain v1 API route. **49 are reads** (GET, plu
 | ✍️ `rhc_wallet_tracker_relabel` | `PATCH /api/v1/rhc/wallet-tracker/watchlist/{address}` | PRO+ | Relabel a tracked wallet; `null` clears the label |
 | `rhc_wallet_tracker_trades` | `/api/v1/rhc/wallet-tracker/trades` | PRO+ | Merged trade feed across your tracked wallets, label-tagged |
 | `rhc_wallet_tracker_summary` | `/api/v1/rhc/wallet-tracker/summary` | PRO+ | Per-wallet rollup from `rhc_trades` — full history, not capture-log scoped |
-| `rhc_copytrade_list` | `/api/v1/rhc/copytrade/subscriptions` | PRO+ | List your copy-trade rules |
-| `rhc_copytrade_get` | `/api/v1/rhc/copytrade/subscriptions/{id}` | PRO+ | One copy-trade rule by numeric id |
+| `rhc_copytrade_list` | `/api/v1/rhc/copytrade/subscriptions` | PRO+ | List your copy-trade rules. Each carries `source_wallets_tracked` / `source_wallets_untracked` + `warnings` — only tracked KOL wallets (`/rhc/kol/wallets`) can ever fire |
+| `rhc_copytrade_get` | `/api/v1/rhc/copytrade/subscriptions/{id}` | PRO+ | One copy-trade rule by numeric id (same tracking fields) |
 | `rhc_copytrade_signals` | `/api/v1/rhc/copytrade/signals` | PRO+ | Fire history, **7-day** retention — the catch-up path after a missed webhook |
 | `rhc_price_alerts_list` | `/api/v1/rhc/price-alerts` | PRO+ | List your market-cap dip/recovery alerts |
 | `rhc_price_alerts_get` | `/api/v1/rhc/price-alerts/{id}` | PRO+ | One price alert by numeric id, with its captured `baseline_mc_usd` |
@@ -169,7 +169,7 @@ These **mutate server state**, consume per-tier quota and fire webhooks. They ar
 
 ### Five things agents get wrong
 
-- **RHC price alerts are polled, not pushed.** Evaluation is a **~15 second poll** of the RHC price table — the RHC price writer emits no `pg_notify`, so there is nothing to react to. Effective latency is that interval plus the token's own price-update cadence. Do **not** promise parity with the Solana price alerts, which are sub-second. `fired_at` on an event is the poll tick that observed the move, not the on-chain moment.
+- **RHC price alerts fire within a few seconds, not sub-second.** Since 2026-09-15 they are evaluated as trades land on the chain trade feed (`rhc:dex_trade`), with price-table polls (5 s / 60 s) and a trade-tape replay as safety nets; the floor is the chain trade flush (about 2 s). Do **not** promise parity with the Solana price alerts, which are sub-second. The create response's `evaluation` block reads `mode: "event_driven"`. `fired_at` on an event is when the evaluator observed the move, not the on-chain moment.
 - **RHC copy-trade has no market-cap band.** There is no `min_mc_usd` / `max_mc_usd` on a copy-trade rule, unlike the Solana engine, because the RHC KOL trade event carries no market cap — the filter would need a per-event DB read on a ~3.3M-trades/day chain, or it would silently never match. Filter on `min_trade_eth` and `only_action` instead.
 
 
