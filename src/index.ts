@@ -8,7 +8,7 @@
  *
  * Key-mode only: authenticate with an `msk_` Bearer API key (get a free key at
  * https://madeonsol.com/pricing — RHC coverage is bundled into every tier). The
- * x402 pay-per-call rail is live on Robinhood Chain too (6 keyless endpoints, discovery at /api/x402/rhc), but is not part of this server. All 68
+ * x402 pay-per-call rail is live on Robinhood Chain too (a narrow keyless subset, listed live at /api/x402/rhc), but is not part of this server. All 68
  * tools map 1:1 to /api/v1/rhc/… routes: 53 reads (GET, plus two POST batch
  * routes that are POST only because the address list is too long for a query
  * string) and 15 tools that genuinely mutate (POST / PATCH / DELETE on
@@ -314,11 +314,12 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_token_locks",
-    "Robinhood Chain TOKEN LOCKS & VESTING feed — newest lock / vesting contracts CREATED on chain across all tokens, newest first, decoded from the locker contracts' own events on our own node (PinkLock-compatible, HoodLock + vesting, Team Finance-compatible, Titan Locker, UNCX-compatible LP lockers, Sablier Lockup v4). Each row carries the on-chain schedule (start_at / cliff_at / end_at, cliff_amount, tranche `schedule`) and a LIVE derived view: locked_* (still locked right now), unlocked_*, next_unlock {at, kind cliff|final|tranche, amount}, status active|completed. `sender` is the depositor/creator — compare it with the token's deployer (rhc_token) to call a DEV LOCK; `recipient` is the beneficiary when different; cancelable_by_sender comes from Sablier's flag (null where the family does not say). Amounts are RAW base units as decimal STRINGS — never coerce to floats; ui/usd/pct are null when decimals or price are unknown. CREATE-ONLY TAPE: withdrawals and cancels are NOT tracked (no RHC locker publishes a verified release event) — `withdrawn` is null (unknown), never 0, and coverage.withdrawals_tracked is false; never present a lock as 'still held' beyond what the schedule says. LP locks (RHC launchpads auto-lock LP on every launch — noise) are excluded unless subject='lp'|'all', carry pair/liquidity units and never claim usd/pct. Cursor: pass pagination.next_since back as `since` to poll for newer, next_before as `before` to page back. Tier: PRO+ (403 on BASIC).",
+    "Robinhood Chain TOKEN LOCKS & VESTING feed — newest lock / vesting contracts CREATED on chain across all tokens, newest first, decoded from the locker contracts' own events on our own node (PinkLock-compatible, HoodLock + vesting, Team Finance-compatible, Titan Locker, UNCX-compatible LP lockers, Sablier Lockup v4). Each row carries the on-chain schedule (start_at / cliff_at / end_at, cliff_amount, tranche `schedule`) and a LIVE derived view: locked_* (still locked right now), unlocked_*, next_unlock {at, kind cliff|final|tranche, amount}, status active|completed. `sender` is the depositor/creator — compare it with the token's deployer (rhc_token) to call a DEV LOCK; `recipient` is the beneficiary when different; cancelable_by_sender comes from Sablier's flag (null where the family does not say). Amounts are RAW base units as decimal STRINGS — never coerce to floats; ui/usd/pct are null when decimals or price are unknown. CREATE-ONLY TAPE: withdrawals and cancels are NOT tracked (no RHC locker publishes a verified release event) — `withdrawn` is null (unknown), never 0, and coverage.withdrawals_tracked is false; never present a lock as 'still held' beyond what the schedule says. LP locks (RHC launchpads auto-lock LP on every launch — noise) are excluded unless subject='lp'|'all', carry pair/liquidity units and never claim usd/pct. Cursor: pass pagination.next_since back as `since` to poll for newer, pagination.next_cursor as `cursor` to page back (strict, no skips; legacy `before` skips same-timestamp rows). PROVENANCE (2026-10-02): provider {id, name, identity, compatible_with, website_url, lock_url} is decided by the locker CONTRACT ADDRESS, never by family: identity 'verified' only for known provider deployments (HoodLock vault + vesting, Sablier Lockup v4, Titan Locker V2.1); 'compatible' means only the event ABI matches (compatible_with names the shape) and the operator is NOT identified — never call a compatible locker by the provider's name as fact. lock_url is set only for the HoodLock vault (proven /proof/lock/{id} format); never construct one. explorer {locker_url, creation_tx_url} = Blockscout evidence; also price_usd (null on LP rows), seconds_until_end, seconds_until_next_unlock, amount_unit (token | lp_token | liquidity). Tier: PRO+ (403 on BASIC).",
     {
       limit: z.number().int().min(1).max(100).default(50).describe("Number of locks (1-100)"),
       since: z.string().optional().describe("ISO instant — only locks created after it (poll cursor = pagination.next_since)"),
-      before: z.string().optional().describe("ISO instant — only locks created before it (page back = pagination.next_before)"),
+      before: z.string().optional().describe("ISO instant — legacy page back (pagination.next_before; skips same-timestamp rows, prefer cursor)"),
+      cursor: z.string().optional().describe("pagination.next_cursor from the previous page: strict (created_at, id) keyset, no repeats, no skips. Not combinable with before"),
       token: z.string().optional().describe("Filter to one token address (0x, 40 hex)"),
       sender: z.string().optional().describe("Depositor / creator wallet (0x, 40 hex)"),
       recipient: z.string().optional().describe("Beneficiary wallet (0x, 40 hex)"),
@@ -331,10 +332,11 @@ function registerTools(server: McpServer) {
       min_pct_of_supply: z.number().min(0).max(100).optional().describe("Post-filter on the deposited amount as % of supply"),
     },
     readOnly,
-    async ({ limit, since, before, token, sender, recipient, locker, family, kind, subject, status, min_usd, min_pct_of_supply }) => {
+    async ({ limit, since, before, cursor, token, sender, recipient, locker, family, kind, subject, status, min_usd, min_pct_of_supply }) => {
       const params: Record<string, string | number> = { limit };
       if (since) params.since = since;
       if (before) params.before = before;
+      if (cursor) params.cursor = cursor;
       if (token) params.token = token;
       if (sender) params.sender = sender;
       if (recipient) params.recipient = recipient;
@@ -351,7 +353,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_token_lock_summary",
-    "Every lock / vesting contract on ONE Robinhood Chain token with a live summary — 'did the team lock, how much, until when, can they cancel'. summary covers the token-subject rows: locked / deposited (raw + ui + usd + % of supply), unlocking_7d_* / unlocking_30d_* (forward schedule), nearest next_unlock, active_cancelable_by_sender (funds are locked against the RECIPIENT, not the locker, when the sender can cancel), counts by family / kind, distinct depositing wallets; LP locks on the token's pools are counted APART (lp_lock_count) because their amounts are pair units. Rows active-first, largest locked first. token.facts_resolved:false means decimals are unknown and every ui/usd/pct is null — say so rather than reading 0. Same create-only caveat as rhc_token_locks (withdrawals not tracked). Tier: PRO+.",
+    "Every lock / vesting contract on ONE Robinhood Chain token with a live summary — 'did the team lock, how much, until when, can they cancel'. summary covers the token-subject rows: locked / deposited (raw + ui + usd + % of supply), unlocking_7d_* / unlocking_30d_* (forward schedule), nearest next_unlock, active_cancelable_by_sender (funds are locked against the RECIPIENT, not the locker, when the sender can cancel), counts by family / kind, distinct depositing wallets; LP locks on the token's pools are counted APART (lp_lock_count) because their amounts are pair units. Rows active-first, largest locked first. token.facts_resolved:false means decimals are unknown and every ui/usd/pct is null — say so rather than reading 0. Same create-only caveat as rhc_token_locks (withdrawals not tracked). Rows carry the same provider (verified only by contract address; compatible = ABI match, operator not identified) / explorer / price_usd / seconds_until_* fields. Tier: PRO+.",
     {
       address: z.string().describe("Token address (0x, 40 hex)"),
       status: z.enum(["active", "completed"]).optional(),
@@ -796,7 +798,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_wallet",
-    "Robinhood Chain wallet profile — any wallet's 90-day trading profile: FIFO cost-basis PnL, per-token breakdown, recent trades, and a reputation block (is_kol, is_deployer + deployer_tier, is_alpha_tracked, dump-cluster membership, early_buyer_tokens). Denomination is ETH, not SOL or USD. IMPORTANT: stats.unattributed_trades counts pre-2026-07-18 rows whose trader_eoa is NULL — those are unattributable by design and are excluded from every PnL figure, so a low analyzed_trades on an old wallet is a data-window limit, not inactivity. stats_unavailable=true means the snapshot timed out (flags still resolve). Tier: PRO+.",
+    "Robinhood Chain wallet profile — any wallet's 90-day trading profile: FIFO cost-basis PnL, per-token breakdown, recent trades, and a reputation block (is_kol, is_deployer + deployer_tier, is_alpha_tracked, dump-cluster membership, early_buyer_tokens). Denomination is ETH, not SOL or USD. IMPORTANT: stats.unattributed_trades counts pre-2026-07-18 rows whose trader_eoa is NULL — those are unattributable by design and are excluded from every PnL figure, so a low analyzed_trades on an old wallet is a data-window limit, not inactivity. stats_unavailable=true means the snapshot timed out (flags still resolve). stats.held_value_eth, open_positions and top_tokens[].still_holding are FIFO figures (DEX buys not matched by a DEX sell), NOT balances: holdings (verified_value_eth, held / transferred_or_disposed counts) and top_tokens[].holding_status check them against the chain via balanceOf on our own node, so quote holdings.verified_value_eth for what the wallet holds now. A contract address returns 404 with address_type=contract. Tier: PRO+.",
     {
       address: z.string().describe("Wallet EVM address (0x, 40 hex). Case-insensitive — lowercased server-side"),
     },
@@ -820,7 +822,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_wallet_positions",
-    "Robinhood Chain wallet open positions — only what the wallet still holds, marked to the current price. Same FIFO pass as rhc_wallet_pnl without the curve and closed positions; use this for 'what is this wallet in right now'. IMPORTANT: positions[].liquidity_basis='v4_virtual_ceiling' means liquidity_usd is a bonding-curve VIRTUAL ceiling, not withdrawable TVL — never size an exit against it; 'measured' means real pool reserves. summary.unpriced_positions are excluded from the value and unrealized totals. Amounts are ETH. Tier: PRO+.",
+    "Robinhood Chain wallet open positions — FIFO-open positions (DEX buys not matched by a DEX sell) marked to the current price, each checked against the chain. Same FIFO pass as rhc_wallet_pnl without the curve and closed positions; use this for 'what is this wallet in right now'. IMPORTANT: a FIFO-open position is not a balance — read positions[].holding_status: HELD, PARTIALLY_REDUCED, TRANSFERRED_OR_DISPOSED (sent away, balance 0), EXTERNAL_INFLOW (more than was bought; the excess has no cost basis) or BALANCE_UNVERIFIED (read failed: no value, never assume held); current_onchain_balance is the balanceOf from our node and summary.holdings.verified_value_eth counts proven balances only. IMPORTANT: positions[].liquidity_basis='v4_virtual_ceiling' means liquidity_usd is a bonding-curve VIRTUAL ceiling, not withdrawable TVL — never size an exit against it; 'measured' means real pool reserves. summary.unpriced_positions are excluded from the value and unrealized totals. Amounts are ETH. Tier: PRO+.",
     {
       address: z.string().describe("Wallet EVM address (0x, 40 hex)"),
     },
@@ -943,7 +945,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_copytrade_list",
-    "List your Robinhood Chain copy-trade rules. Each rule mirrors 1+ TRACKED KOL wallets (the set behind /rhc/kol/wallets) and emits a signal (webhook and/or the rhc:copytrade:signals WS channel) when they trade on chain 4663. Returns id, name, source_wallets, min_trade_eth, only_action, sizing_mode, sizing_amount, delivery_mode, webhook_url, is_active. Rule caps are PER CHAIN and do not consume the Solana copy-trade budget: PRO 3 rules / 5 wallets each, ULTRA 20 / 50, BUSINESS 100 / 250. Tier: PRO+.",
+    "List your Robinhood Chain copy-trade rules. Each rule mirrors 1+ TRACKED KOL wallets (the set behind /rhc/kol/wallets) and emits a signal (webhook and/or the rhc:copytrade:signals WS channel) when they trade on chain 4663. Returns id, name, source_wallets, min_trade_eth, only_action, sizing_mode, sizing_amount, delivery_mode, webhook_url, is_active, source_wallets_tracked / source_wallets_untracked and operational_state (eligible / no_tracked_sources = kept but can never fire / unknown = tracking read failed; separate from is_active). Rule caps are PER CHAIN and do not consume the Solana copy-trade budget: PRO 3 rules / 5 wallets each, ULTRA 20 / 50, BUSINESS 100 / 250. Tier: PRO+.",
     {},
     readOnly,
     async () => ({
@@ -1331,7 +1333,7 @@ const TOOL_CARDS = [
   { name: "rhc_alpha_wallets", description: "RHC smart-money wallets — net_eth, win_rate, memecoin_share, likely_bot. PRO+." },
   { name: "rhc_wallet", description: "RHC wallet 90-day profile — ETH PnL, per-token breakdown, reputation flags. PRO+." },
   { name: "rhc_wallet_pnl", description: "RHC wallet FIFO cost-basis PnL — curve, closed + open positions. PRO+." },
-  { name: "rhc_wallet_positions", description: "RHC wallet open positions marked to market; check liquidity_basis. PRO+." },
+  { name: "rhc_wallet_positions", description: "RHC wallet FIFO-open positions marked to market, each with an on-chain holding_status; check liquidity_basis. PRO+." },
   { name: "rhc_wallet_trades", description: "One RHC wallet's trade tape, keyset-paginated by wallet (not token). PRO+." },
   { name: "rhc_wallet_tracker_list", description: "List your RHC watchlist. Quota is per-chain. PRO+." },
   { name: "rhc_wallet_tracker_add", description: "WRITES — track an RHC wallet (address lowercased on write). PRO+." },
