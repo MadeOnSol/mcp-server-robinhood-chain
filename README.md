@@ -1,5 +1,25 @@
 # mcp-server-robinhood-chain
 
+
+> **Agent Intelligence Gateway (new in 0.15.0, opt-in).** Set
+> `MADEONSOL_AGENT_GATEWAY_ENABLED=on` together with a paid (PRO or higher)
+> `MADEONSOL_API_KEY` to add six research tools fixed to `robinhood-chain`:
+> `discover_opportunities`, `evaluate_token`, `inspect_wallet`,
+> `inspect_deployer`, `evaluate_signal` and `changes_since`. They call
+> `POST /api/v1/agent-gateway/actions` with your key and never sign or pay an
+> x402 request. RHC limits are explicit: `evaluate_signal` reports the
+> Signal Scorecard as unsupported on Robinhood Chain (there is no verified RHC
+> equivalent), and `changes_since` covers three curated KOL/deployer event
+> families, not every swap. Without the opt-in the tool inventory is
+> unchanged. A hosted endpoint is also available at
+> `https://madeonsol.com/api/agent-gateway/mcp` (Bearer `msk_` key, no MCP
+> OAuth). [Gateway contract](../../docs/agent-gateway.md).
+
+The hosted `/api/agent-gateway/mcp` transport uses per-request
+account keys and custom Authorization headers. It does not implement MCP OAuth;
+do not expose this package's private loopback HTTP adapter as a public service.
+
+
 [![npm version](https://img.shields.io/npm/v/mcp-server-robinhood-chain?style=flat-square)](https://www.npmjs.com/package/mcp-server-robinhood-chain)
 [![npm downloads](https://img.shields.io/npm/dm/mcp-server-robinhood-chain?style=flat-square)](https://www.npmjs.com/package/mcp-server-robinhood-chain)
 [![MCP](https://img.shields.io/badge/MCP-server-8A2BE2?style=flat-square)](https://modelcontextprotocol.io/)
@@ -18,6 +38,8 @@ RHC coverage is **bundled into every tier at no extra cost**. Get a free API key
 > **0.5.0** — version alignment with the wider RHC SDK release: the stream channel names were corrected in the TS/Python/Rust SDKs (the RHC firehose channel is `rhc:dex_trades`; the server accepts `rhc:trades` only as a deprecated alias of it). This MCP server exposes REST tools, not WebSocket channels, so no tool behavior changed — the `rhc_trades` tool (the `GET /rhc/trades` tape) is unaffected.
 
 > **Key-mode only.** Authenticate with an `msk_` Bearer API key (`MADEONSOL_API_KEY`). Robinhood Chain does have a keyless x402 pay-per-call rail — now 10 endpoints (grew from the original 6), documented at [madeonsol.com/robinhood/x402](https://madeonsol.com/robinhood/x402) — but it is not part of this server.
+
+> **Server update 2026-10-04 (no package change needed): RHC copy-trade rules follow any valid source wallet.** `source_wallets` no longer have to be tracked KOL wallets (`/rhc/kol/wallets`): any valid `0x` wallet fires, KOL membership is optional enrichment, and copy-trade sources do not use Wallet Tracker quota. Each rule reports `source_admission` (`any_wallet`) and `operational_state` (`eligible`, or an infrastructure state `monitoring_pending` / `monitoring_unavailable` / `source_capacity_unavailable`). `source_wallets_tracked` / `source_wallets_untracked`, `no_tracked_sources` and the `untracked_source_wallets` warning are legacy, still filled. Existing rules work without editing. Limits are unchanged: PRO 3 rules × 5 wallets, ULTRA 20 × 50, BUSINESS 100 × 250.
 
 > **New in 0.13.0: token lock provenance.** Tool descriptions: Token lock rows carry `provider` (identity decided by the locker contract address: `verified` only for known provider deployments; `compatible` = ABI match, operator not identified, no id / website / `lock_url`), `explorer` (Blockscout links), `price_usd`, `seconds_until_end`, `seconds_until_next_unlock` (server 2026-10-02). RHC withdrawals stay untracked (`withdrawn` null); LP rows never get usd / price / %. Additive only. `rhc_token_locks` accepts `cursor` (strict keyset paging).
 
@@ -90,7 +112,7 @@ Each tool maps 1:1 to a Robinhood Chain v1 API route. **49 are reads** (GET, plu
 | `rhc_kol_leaderboard` | `/api/v1/rhc/kol/leaderboard` | BASIC | KOLs ranked by trade count then net ETH flow (`24h`/`7d`/`30d`) |
 | `rhc_kol_hot_tokens` | `/api/v1/rhc/kol/hot-tokens` | BASIC | Consensus tokens bought by 2+ distinct KOLs in the window |
 | `rhc_kol_profile` | `/api/v1/rhc/kol/{wallet}` | BASIC | Single KOL profile — stats over last 200 trades + 50 recent |
-| `rhc_kol_coordination` | `/api/v1/rhc/kol/coordination` | BASIC | Tokens bought by `min_kols`+ distinct KOLs — net ETH, accumulating vs distributing, `time_to_consensus_sec`, per-KOL breakdown |
+| `rhc_kol_coordination` | `/api/v1/rhc/kol/coordination` | BASIC | Full-window SQL KOL consensus (15m/1h/6h/24h/7d), not the 1,000-trade hot-token sample — net ETH, time-to-consensus and per-KOL breakdown |
 | `rhc_kol_first_touches` | `/api/v1/rhc/kol/first-touches` | BASIC | Earliest KOL buy per token (discovery signal) — MC at entry, token age, `tx_hash`. `evm_address` on ULTRA only |
 | `rhc_trades` | `/api/v1/rhc/trades` | PRO+ | DEX trade tape — Uniswap v2/v3/v4 swaps with the effective `trader_eoa` + MEV fields |
 | `rhc_lp_events` | `/api/v1/rhc/lp-events` | PRO+ | Liquidity **removals** feed (the rug signal) — v2/v3 `Burn` + v4 negative `ModifyLiquidity`, raw uint256 strings, `provider_is_token_deployer`. Removals only, adds are not persisted |
@@ -128,7 +150,7 @@ Each tool maps 1:1 to a Robinhood Chain v1 API route. **49 are reads** (GET, plu
 | ✍️ `rhc_wallet_tracker_relabel` | `PATCH /api/v1/rhc/wallet-tracker/watchlist/{address}` | PRO+ | Relabel a tracked wallet; `null` clears the label |
 | `rhc_wallet_tracker_trades` | `/api/v1/rhc/wallet-tracker/trades` | PRO+ | Merged trade feed across your tracked wallets, label-tagged |
 | `rhc_wallet_tracker_summary` | `/api/v1/rhc/wallet-tracker/summary` | PRO+ | Per-wallet rollup from `rhc_trades` — full history, not capture-log scoped |
-| `rhc_copytrade_list` | `/api/v1/rhc/copytrade/subscriptions` | PRO+ | List your copy-trade rules. Each carries `source_wallets_tracked` / `source_wallets_untracked` + `warnings` — only tracked KOL wallets (`/rhc/kol/wallets`) can ever fire |
+| `rhc_copytrade_list` | `/api/v1/rhc/copytrade/subscriptions` | PRO+ | List your copy-trade rules. Each carries `source_admission` + `operational_state`; any valid `0x` source wallet fires, KOL or not (since 2026-10-04; `source_wallets_tracked` / `_untracked` are legacy) |
 | `rhc_copytrade_get` | `/api/v1/rhc/copytrade/subscriptions/{id}` | PRO+ | One copy-trade rule by numeric id (same tracking fields) |
 | `rhc_copytrade_signals` | `/api/v1/rhc/copytrade/signals` | PRO+ | Fire history, **7-day** retention — the catch-up path after a missed webhook |
 | `rhc_price_alerts_list` | `/api/v1/rhc/price-alerts` | PRO+ | List your market-cap dip/recovery alerts |

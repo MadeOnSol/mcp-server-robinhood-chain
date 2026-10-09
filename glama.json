@@ -5,7 +5,7 @@
   ],
   "display_name": "Robinhood Chain — EVM-native trading intelligence",
   "description": "Robinhood Chain (chain id 4663) on-chain trading intelligence for AI agents — real-time KOL trades from tracked wallets' verified EVM addresses, KOL coordination + first-touch discovery signals, the full Uniswap v2/v3/v4 DEX trade tape, token discovery with launch-bundle + early-buyer-quality detection (single and batch), 1-minute OHLC candles, token locks & vesting, deployer reputation (graduation_rate / runner_rate over 370k+ ranked deployers) with alerts, trajectory and per-deployer launch history, and smart-money wallet ranking — plus full CRUD over the RHC rule engines (copy-trade rules, market-cap dip/recovery price alerts, KOL coordination alerts and first-touch push subscriptions), whose quotas are per-chain and do not consume the Solana budget. EVM-native throughout (0x addresses, eth_amount, tx_hash, net_flow_eth) from our self-hosted RHC node. Free tier 200 requests/day (live feeds 5-min delayed; paid tiers are real-time); auth via msk_ API key, bundled into every tier at no extra cost.",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "homepage": "https://madeonsol.com/robinhood",
   "repository": "https://github.com/madeonsol/mcp-server-robinhood-chain",
   "license": "MIT",

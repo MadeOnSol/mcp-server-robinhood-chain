@@ -21,6 +21,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { VERSION } from "./version.js";
 import { createPrivateHttpServer, readHttpConfig } from "./http-security.js";
+import { registerAgentGatewayTools } from "./agent-gateway.js";
 
 // MCP `initialize` response `instructions` field — see the matching comment
 // in mcp-server-madeonsol/src/index.ts for why this was previously unset.
@@ -155,6 +156,8 @@ const updateWrite = { readOnlyHint: false, destructiveHint: false, idempotentHin
 const destroyWrite = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true };
 
 function registerTools(server: McpServer) {
+  registerAgentGatewayTools(server, { baseUrl: BASE_URL, apiKey: MADEONSOL_API_KEY, chain: "robinhood-chain",
+    enabled: process.env.MADEONSOL_AGENT_GATEWAY_ENABLED === "on" });
   /* ── KOL intelligence ── */
 
   server.tool(
@@ -219,7 +222,7 @@ function registerTools(server: McpServer) {
     "rhc_kol_coordination",
     "Robinhood Chain KOL coordination / clustering — tokens bought by min_kols+ DISTINCT tracked KOLs inside the window, ranked by KOL count then buy ETH. Per token: buy/sell/net ETH, signal ('accumulating' when net_eth >= 0, else 'distributing'), exited_count vs holders_count, time_to_consensus_sec (first→last KOL buy), MC at first KOL buy, current/peak MC, liquidity, deployer_tier, token age, and the per-KOL breakdown (evm_address, name, twitter_url, buy_eth, sell_eth, exited). Computed read-time from the RHC KOL tape — RHC has no KOL winrate/strategy scores, so those Solana fields are absent. Tier: BASIC.",
     {
-      period: z.enum(["1h", "6h", "24h", "7d"]).default("24h").describe("Rolling window over KOL buys"),
+      period: z.enum(["15m", "1h", "6h", "24h", "7d"]).default("24h").describe("Exact full-window SQL aggregation over KOL buys"),
       min_kols: z.number().min(2).max(50).default(2).describe("Minimum distinct KOL buyers for a token to qualify (2-50)"),
       limit: z.number().min(1).max(50).default(20).describe("Number of tokens to return (1-50)"),
       min_mc_usd: z.number().min(0).optional().describe("Minimum market cap at the FIRST KOL buy (tokens with unknown MC are dropped when a band is set)"),
@@ -945,7 +948,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_copytrade_list",
-    "List your Robinhood Chain copy-trade rules. Each rule mirrors 1+ TRACKED KOL wallets (the set behind /rhc/kol/wallets) and emits a signal (webhook and/or the rhc:copytrade:signals WS channel) when they trade on chain 4663. Returns id, name, source_wallets, min_trade_eth, only_action, sizing_mode, sizing_amount, delivery_mode, webhook_url, is_active, source_wallets_tracked / source_wallets_untracked and operational_state (eligible / no_tracked_sources = kept but can never fire / unknown = tracking read failed; separate from is_active). Rule caps are PER CHAIN and do not consume the Solana copy-trade budget: PRO 3 rules / 5 wallets each, ULTRA 20 / 50, BUSINESS 100 / 250. Tier: PRO+.",
+    "List your Robinhood Chain copy-trade rules. Each rule mirrors 1+ source wallets and emits a signal (webhook and/or the rhc:copytrade:signals WS channel) when they trade on chain 4663. Under source_admission 'any_wallet' (production since 2026-10-04) any valid 0x wallet fires, KOL or not; under the legacy 'kol_only' engine only tracked KOL wallets (/rhc/kol/wallets) fire. Returns id, name, source_wallets, min_trade_eth, only_action, sizing_mode, sizing_amount, delivery_mode, webhook_url, is_active, source_admission and operational_state (separate from is_active: 'eligible', or under any_wallet the infrastructure states monitoring_pending / monitoring_unavailable / source_capacity_unavailable; legacy kol_only: no_tracked_sources = can never fire, unknown = tracking read failed). source_wallets_tracked / source_wallets_untracked are deprecated KOL enrichment, still filled. Rule caps are PER CHAIN and do not consume the Solana copy-trade budget: PRO 3 rules / 5 wallets each, ULTRA 20 / 50, BUSINESS 100 / 250. Tier: PRO+.",
     {},
     readOnly,
     async () => ({
@@ -955,7 +958,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_copytrade_create",
-    "CREATE a Robinhood Chain copy-trade rule (POST — this writes and consumes quota; do not call it to explore). source_wallets must be TRACKED KOL wallets (the set behind /rhc/kol/wallets): any 0x address is accepted, but the engine only evaluates trades of tracked wallets, so read source_wallets_untracked + warnings (code untracked_source_wallets) on the response and tell the user which wallets can never fire. Amounts are ETH, not SOL. IMPORTANT: RHC copy-trade has NO market-cap band (no min_mc_usd/max_mc_usd) — unlike the Solana engine — because the RHC KOL trade event carries no market cap, so the filter would either need a per-event DB lookup on a ~3.3M-trades/day chain or silently never match. Returns webhook_secret EXACTLY ONCE when delivery_mode includes 'webhook' — store it, payloads are HMAC-SHA256 over `<timestamp>.<body>` in X-MadeOnSol-Signature. Rule/wallet caps are PER CHAIN (PRO 3 rules / 5 wallets, ULTRA 20 / 50, BUSINESS 100 / 250); exceeding the rule cap returns 409. Tier: PRO+.",
+    "CREATE a Robinhood Chain copy-trade rule (POST — this writes and consumes quota; do not call it to explore). source_wallets are 0x addresses. Read source_admission on the response: 'any_wallet' means every valid address is followed, KOL or not (KOL membership is enrichment only; copy-trade sources do not use the Wallet Tracker quota) and operational_state only reports infrastructure conditions (monitoring_pending / monitoring_unavailable / source_capacity_unavailable). Under the legacy 'kol_only' engine only tracked KOL wallets (/rhc/kol/wallets) fire: then surface any untracked_source_wallets warning. Amounts are ETH, not SOL. IMPORTANT: RHC copy-trade has NO market-cap band (no min_mc_usd/max_mc_usd) — unlike the Solana engine — because the RHC KOL trade event carries no market cap, so the filter would either need a per-event DB lookup on a ~3.3M-trades/day chain or silently never match. Returns webhook_secret EXACTLY ONCE when delivery_mode includes 'webhook' — store it, payloads are HMAC-SHA256 over `<timestamp>.<body>` in X-MadeOnSol-Signature. Rule/wallet caps are PER CHAIN (PRO 3 rules / 5 wallets, ULTRA 20 / 50, BUSINESS 100 / 250); exceeding the rule cap returns 409. Tier: PRO+.",
     {
       source_wallets: z.array(z.string()).min(1).max(250).describe("1-250 source EVM wallets to mirror (0x, 40 hex). Lowercased on write. Capped by tier: PRO 5, ULTRA 50, BUSINESS 250"),
       sizing_amount: z.number().positive().describe("Amount in ETH, interpreted by sizing_mode. Required"),
@@ -986,7 +989,7 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_copytrade_update",
-    "UPDATE a Robinhood Chain copy-trade rule (PATCH — this writes). The response carries source_wallets_tracked / source_wallets_untracked + warnings: only tracked KOL wallets (/rhc/kol/wallets) can ever fire, so surface any untracked_source_wallets warning. Send only the fields you want changed; is_active:false pauses a rule without deleting it. source_wallets is a whole-list REPLACE and is re-checked against the tier wallet cap, so a PRO rule cannot be PATCHed past 5 wallets. Pass null for name or webhook_url to clear them. There is no market-cap band to set on RHC. Tier: PRO+.",
+    "UPDATE a Robinhood Chain copy-trade rule (PATCH — this writes). The response carries source_admission + operational_state: under 'any_wallet' any valid source wallet fires; under the legacy 'kol_only' engine only tracked KOL wallets fire, so surface any untracked_source_wallets warning. Send only the fields you want changed; is_active:false pauses a rule without deleting it. source_wallets is a whole-list REPLACE and is re-checked against the tier wallet cap, so a PRO rule cannot be PATCHed past 5 wallets. Pass null for name or webhook_url to clear them. There is no market-cap band to set on RHC. Tier: PRO+.",
     {
       id: z.number().int().positive().describe("Copy-trade rule id (positive integer)"),
       name: z.string().min(1).max(64).nullable().optional().describe("New label, or null to clear"),
