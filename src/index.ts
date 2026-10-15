@@ -8,8 +8,8 @@
  *
  * Key-mode only: authenticate with an `msk_` Bearer API key (get a free key at
  * https://madeonsol.com/pricing — RHC coverage is bundled into every tier). The
- * x402 pay-per-call rail is live on Robinhood Chain too (a narrow keyless subset, listed live at /api/x402/rhc), but is not part of this server. All 68
- * tools map 1:1 to /api/v1/rhc/… routes: 53 reads (GET, plus two POST batch
+ * x402 pay-per-call rail is live on Robinhood Chain too (a narrow keyless subset, listed live at /api/x402/rhc), but is not part of this server. All 73
+ * tools map 1:1 to /api/v1/rhc/… routes: 58 reads (GET, plus two POST batch
  * routes that are POST only because the address list is too long for a query
  * string) and 15 tools that genuinely mutate (POST / PATCH / DELETE on
  * copy-trade, price-alert, coordination and first-touch rules, plus the three
@@ -151,6 +151,8 @@ function definedOnly(obj: Record<string, unknown>): Record<string, unknown> {
  *            idempotent only in the sense that a repeat returns 404.
  */
 const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true };
+/** Opt-in query flags: only sent when true (the API default is false). */
+const flag = (v?: boolean) => (v ? "true" : undefined);
 const createWrite = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
 const updateWrite = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
 const destroyWrite = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true };
@@ -183,14 +185,16 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_kol_leaderboard",
-    "Robinhood Chain KOL activity leaderboard — KOLs ranked by trade count, then net ETH flow, over the chosen window. net_eth is buy−sell flow (not realized PnL). Tier: BASIC.",
+    "Robinhood Chain KOL activity leaderboard — KOLs ranked by trade count, then net ETH flow, over the chosen window. net_eth is buy−sell flow (not realized PnL). sort=winrate_7d|winrate_30d ranks by FIFO win rate over closed positions instead (fresh scores only, at least min_closed closed positions). Tier: BASIC.",
     {
       period: z.enum(["24h", "7d", "30d"]).default("24h").describe("Rolling window"),
       limit: z.number().min(1).max(100).default(50).describe("Number of KOLs to return (1-100)"),
+      sort: z.enum(["trades", "winrate_7d", "winrate_30d"]).optional().describe("trades (default) or FIFO win rate"),
+      min_closed: z.number().int().min(1).max(100).optional().describe("With a winrate sort: minimum closed positions (default 3)"),
     },
     readOnly,
-    async ({ period, limit }) => ({
-      content: [{ type: "text" as const, text: await query("/api/v1/rhc/kol/leaderboard", { period, limit }) }],
+    async ({ period, limit, sort, min_closed }) => ({
+      content: [{ type: "text" as const, text: await query("/api/v1/rhc/kol/leaderboard", { period, limit, sort, min_closed }) }],
     })
   );
 
@@ -208,13 +212,28 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "rhc_kol_profile",
-    "Robinhood Chain single KOL profile — aggregate stats over one KOL's last 200 RHC trades plus their 50 most recent trades. Tier: BASIC.",
+    "Robinhood Chain single KOL profile — aggregate stats over one KOL's last 200 RHC trades plus their 50 most recent trades. include_performance (PRO+) adds FIFO win rate / strategy over closed positions (same data_fingerprint as /pnl). Tier: BASIC.",
     {
       wallet: z.string().describe("KOL EVM wallet address (0x, 40 hex)"),
+      include_performance: z.boolean().optional().describe("PRO+: add FIFO performance (win rate 7d/30d, closed positions, median hold, strategy tag)"),
     },
     readOnly,
-    async ({ wallet }) => ({
-      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/kol/${encodeURIComponent(wallet)}`) }],
+    async ({ wallet, include_performance }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/kol/${encodeURIComponent(wallet)}`, { include_performance: flag(include_performance) }) }],
+    })
+  );
+  server.tool(
+    "rhc_kol_scout_leaderboard",
+    "Robinhood Chain KOL scout leaderboard — which tracked KOLs are FIRST into tokens that other KOLs then follow. A first touch = a KOL buy of a token no KOL bought before (chain order), counted over [now-30d, now-4h]; followers = distinct OTHER KOLs buying within 4 h after. Per scout: n_first_touches_30d, swarm_3plus_pct / swarm_5plus_pct (share of touches followed by 3+ / 5+ KOLs), avg_followers_4h, scout_score + scout_tier S/A/B/C (null below min_first_touches). One KOL with several EVM addresses is one scout. 503 scout_scores_unavailable until the server function exists. Tier: PRO+.",
+    {
+      limit: z.number().int().min(1).max(100).optional().describe("Rows (default 50)"),
+      scout_tier: z.enum(["S", "A", "B", "C"]).optional().describe("Only this tier"),
+      sort: z.enum(["scout_score", "n_first_touches_30d", "swarm_3plus_pct", "swarm_5plus_pct", "avg_followers_4h"]).optional().describe("Ordering (default swarm_3plus_pct)"),
+      min_first_touches: z.number().int().min(1).max(1000).optional().describe("Minimum first touches in 30 d (default 30)"),
+    },
+    readOnly,
+    async ({ limit, scout_tier, sort, min_first_touches }) => ({
+      content: [{ type: "text" as const, text: await query("/api/v1/rhc/kol/scouts/leaderboard", { limit, scout_tier, sort, min_first_touches }) }],
     })
   );
 
@@ -499,10 +518,11 @@ function registerTools(server: McpServer) {
     "Robinhood Chain early-buyer quality — a 0–100 read on a token's earliest distinct buyer cohort (first 20): win-rate, KOL-presence, bot-domination and bundle-buyer legs, plus the informational dump-cluster ensemble (dump_cluster_count flags the pattern but does not move the score). Neutral score (50) with a note when the token has no buyer history yet. Tier: BASIC.",
     {
       address: z.string().describe("Token address (0x, 40 hex)"),
+      include_balances: z.boolean().optional().describe("PRO+: add dump_cluster_held_now — what the dump-cluster wallets counted in dump_cluster_count hold now (balanceOf), totals only when every wallet was read"),
     },
     readOnly,
-    async ({ address }) => ({
-      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/buyer-quality`) }],
+    async ({ address, include_balances }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/buyer-quality`, { include_balances: flag(include_balances) }) }],
     })
   );
 
@@ -523,10 +543,56 @@ function registerTools(server: McpServer) {
     "Robinhood Chain launch-bundle detection — ranks the first 20 distinct buyers by on-chain order and flags a bundle when 3+ make their first buy in the SAME BLOCK (bundle_kind 'same_block'; there is no atomic_tx on an Arbitrum Orbit L2), then reports the cohort's current held %. Field-gated by tier: BASIC gets the scalar bundle signal; PRO adds the top-10 wallets; ULTRA returns the full cohort with alpha-wallet identity. Tier: BASIC.",
     {
       address: z.string().describe("Token address (0x, 40 hex)"),
+      include_balances: z.boolean().optional().describe("PRO+: add held_now (balanceOf from our node for every cohort wallet, one Multicall3 batch) + wallets[].balance_now. Totals only when every wallet was read; a failed read is never 0."),
     },
     readOnly,
-    async ({ address }) => ({
-      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/bundle`) }],
+    async ({ address, include_balances }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/bundle`, { include_balances: flag(include_balances) }) }],
+    })
+  );
+  server.tool(
+    "rhc_token_bundles",
+    "Every coordinated buy cluster on a Robinhood Chain token in a window, the launch bundle AND groups that buy together later (rhc_token_bundle only scores the first-20 cohort). A cluster = one block where >= min_wallets distinct effective trading accounts (ERC-4337 senders resolved) bought. Per cluster: block_number, at, minutes_after_launch + phase (launch = within 5 min of first sighting, else later), wallet_count, new_wallets (no earlier buy of the token), same_tx_groups (txs carrying 3+ of them; WEAKER evidence than on Solana because a 4337 bundler batches unrelated userOps), eth_volume, token_volume_raw (uint256 string), wallets (<= 50), and exit (what those wallets have SOLD since, from the live bundle tracker; null when the cluster is not followed). summary.baseline = buys per active block (busy tokens share blocks innocently): evidence, not a verdict. include_balances adds held_now for the 3 most recent clusters. 503 bundle_clusters_unavailable until the server function exists. Tier: PRO+.",
+    {
+      address: z.string().describe("Token address (0x, 40 hex)"),
+      window: z.enum(["1h", "6h", "24h"]).optional().describe("Lookback window (default 24h)"),
+      min_wallets: z.number().int().min(3).max(20).optional().describe("Minimum distinct buyers in one block (default 3)"),
+      limit: z.number().int().min(1).max(100).optional().describe("Clusters returned, newest first (default 50)"),
+      include_balances: z.boolean().optional().describe("Add held_now (balanceOf) to the 3 most recent clusters"),
+    },
+    readOnly,
+    async ({ address, window, min_wallets, limit, include_balances }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/bundles`, { window, min_wallets, limit, include_balances: flag(include_balances) }) }],
+    })
+  );
+  server.tool(
+    "rhc_token_bundle_share",
+    "One 'bundled now' figure for a Robinhood Chain token: bundled_pct_of_supply_now = share of total supply held RIGHT NOW by every bundle account (the launch cohort UNION every coordinated cluster in the window, each account counted once), from balanceOf on our node. Null (with held_now.incomplete_reason) unless every account was read: never a partial sum. scope says launch_and_clusters or launch_cohort_only (clusters unavailable). Cached 30 s per (token, window, min_wallets). Pair with the WS channel rhc:token_bundles to re-read on every new cluster or exit. Tier: PRO+.",
+    {
+      address: z.string().describe("Token address (0x, 40 hex)"),
+      window: z.enum(["1h", "6h", "24h"]).optional().describe("Cluster window (default 24h)"),
+      min_wallets: z.number().int().min(3).max(20).optional().describe("Minimum distinct buyers per cluster (default 3)"),
+    },
+    readOnly,
+    async ({ address, window, min_wallets }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/bundle-share`, { window, min_wallets }) }],
+    })
+  );
+  server.tool(
+    "rhc_token_kol_trades",
+    "Every tracked-KOL trade on one Robinhood Chain token in one payload, newest first (keyset paged with next_cursor + has_more): kol_name, wallet, action, eth_amount, token amount, price and market cap at the trade, tx_hash, log_index, block_number, dex. include_balances (PRO+) adds each KOL's CURRENT balance from balanceOf on our node (unverified with a reason when a read fails, never 0, never reconstructed from trades). Tier: BASIC (5-min delayed, 20 rows), PRO+ real time.",
+    {
+      address: z.string().describe("Token address (0x, 40 hex)"),
+      limit: z.number().int().min(1).max(200).optional().describe("Rows (default 100)"),
+      action: z.enum(["buy", "sell"]).optional().describe("Only buys or only sells"),
+      kol: z.string().optional().describe("Only this KOL wallet (0x)"),
+      since: z.string().optional().describe("ISO timestamp lower bound"),
+      cursor: z.string().optional().describe("next_cursor from the previous page"),
+      include_balances: z.boolean().optional().describe("PRO+: add each KOL's current balanceOf"),
+    },
+    readOnly,
+    async ({ address, limit, action, kol, since, cursor, include_balances }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/kol-trades`, { limit, action, kol, since, cursor, include_balances: flag(include_balances) }) }],
     })
   );
 
@@ -550,10 +616,12 @@ function registerTools(server: McpServer) {
     {
       address: z.string().describe("Token address (0x, 40 hex)"),
       limit: z.number().int().min(1).max(20).optional().describe("Rows, capped at 20 (default 20)"),
+      verify_current_balances: z.boolean().optional().describe("ULTRA+: read every early buyer's balanceOf now (onchain_balance_verification); strict, a failed read answers 503 instead of a guess"),
+      include_scout_scores: z.boolean().optional().describe("Add is_kol + scout_score per buyer, each KOL scored as of its OWN first buy (point in time, no hindsight)"),
     },
     readOnly,
-    async ({ address, limit }) => ({
-      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/early-buyers`, { limit }) }],
+    async ({ address, limit, verify_current_balances, include_scout_scores }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/early-buyers`, { limit, verify_current_balances: flag(verify_current_balances), include_scout_scores: flag(include_scout_scores) }) }],
     })
   );
 
@@ -603,10 +671,11 @@ function registerTools(server: McpServer) {
       address: z.string().describe("Token address (0x, 40 hex)"),
       limit: z.number().int().min(1).max(200).optional().describe("Rows (capped 50 on PRO, 200 on ULTRA/BUSINESS)"),
       offset: z.number().int().min(0).max(10000).optional().describe("Page offset"),
+      include_wallet_flags: z.boolean().optional().describe("Add holders[].wallet_flags (bot / bundler / dumper / KOL / deployer reputation) + wallet_flags_meta"),
     },
     readOnly,
-    async ({ address, limit, offset }) => ({
-      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/holders`, { limit, offset }) }],
+    async ({ address, limit, offset, include_wallet_flags }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/tokens/${encodeURIComponent(address)}/holders`, { limit, offset, include_wallet_flags: flag(include_wallet_flags) }) }],
     })
   );
 
@@ -653,14 +722,31 @@ function registerTools(server: McpServer) {
       limit: z.number().min(1).max(100).default(50).describe("Page size (1-100, default 50)"),
       offset: z.number().min(0).max(10000).optional().describe("Pagination offset"),
       sort: z.enum(["first_seen_at", "peak_mc_usd"]).optional().describe("first_seen_at (default, newest first, applied in Postgres) or peak_mc_usd (page-scoped re-sort)"),
+      include_launches_24h: z.boolean().optional().describe("Add launches_24h (tokens this deployer launched in the last 24 h)"),
     },
     readOnly,
-    async ({ address, limit, offset, sort }) => {
+    async ({ address, limit, offset, sort, include_launches_24h }) => {
       const params: Record<string, string | number> = { limit };
       if (offset !== undefined) params.offset = offset;
       if (sort) params.sort = sort;
+      if (include_launches_24h) params.include_launches_24h = "true";
       return { content: [{ type: "text" as const, text: await query(`/api/v1/rhc/deployer-hunter/${encodeURIComponent(address)}/tokens`, params) }] };
     }
+  );
+  server.tool(
+    "rhc_deployer_activity",
+    "Robinhood Chain developer activity timeline for one deployer: launches (tokens whose recorded deployer is this address; attribution creator = seen at launch, pool_creator = only the first pool's creator is known, weaker) and dev_buy / dev_sell of its OWN tokens by the address itself (ERC-4337 senders resolved), one event per trade leg, newest first, keyset paged (next_cursor; coverage.scan_truncated says where a bounded scan stopped, never a false end). event_id equals the rhc:dev_activity WS id. token_amount_raw is an exact uint256 string. Not included: developer token transfers, other wallets of the same person, history older than coverage.dev_trades_complete_from. Tier: PRO+.",
+    {
+      address: z.string().describe("Deployer EVM wallet address (0x, 40 hex)"),
+      limit: z.number().int().min(1).max(200).optional().describe("Events (default 100)"),
+      since: z.string().optional().describe("ISO timestamp lower bound (default 30 days, at most 90)"),
+      types: z.string().optional().describe("Comma list of launch, dev_buy, dev_sell (default all)"),
+      cursor: z.string().optional().describe("next_cursor from the previous page"),
+    },
+    readOnly,
+    async ({ address, limit, since, types, cursor }) => ({
+      content: [{ type: "text" as const, text: await query(`/api/v1/rhc/deployer-hunter/${encodeURIComponent(address)}/activity`, { limit, since, types, cursor }) }],
+    })
   );
 
   server.tool(
@@ -1301,7 +1387,8 @@ const TOOL_CARDS = [
   { name: "rhc_kol_feed", description: "Real-time Robinhood Chain KOL trade feed — EVM-native (0x, eth_amount, tx_hash)." },
   { name: "rhc_kol_leaderboard", description: "RHC KOLs ranked by trade count then net ETH flow (24h/7d/30d)." },
   { name: "rhc_kol_hot_tokens", description: "RHC consensus tokens — bought by 2+ distinct KOLs in the window." },
-  { name: "rhc_kol_profile", description: "Single RHC KOL profile — stats over last 200 trades + 50 recent." },
+  { name: "rhc_kol_profile", description: "Single RHC KOL profile — stats over last 200 trades + 50 recent; include_performance adds FIFO win rate." },
+  { name: "rhc_kol_scout_leaderboard", description: "RHC KOLs who are first into tokens other KOLs follow (scout score S/A/B/C, point in time). PRO+." },
   { name: "rhc_kol_coordination", description: "RHC tokens bought by N+ distinct KOLs — net ETH, accumulating vs distributing." },
   { name: "rhc_kol_first_touches", description: "RHC earliest KOL buy per token — the discovery signal, with MC at entry." },
   { name: "rhc_trades", description: "RHC DEX trade tape — Uniswap v2/v3/v4 swaps with trader_eoa + MEV fields. PRO+." },
@@ -1317,7 +1404,10 @@ const TOOL_CARDS = [
   { name: "rhc_token_kol_consensus", description: "RHC KOL consensus on a token — buyers/sellers, exit rate, net_flow_eth. PRO+." },
   { name: "rhc_token_buyer_quality", description: "RHC 0–100 early-buyer quality with bundle + dump-cluster legs." },
   { name: "rhc_token_batch_buyer_quality", description: "Early-buyer quality for up to 20 RHC tokens in one call (cap is 20, not 50)." },
-  { name: "rhc_token_bundle", description: "RHC launch-bundle detection (same_block) + how much the cohort still holds." },
+  { name: "rhc_token_bundle", description: "RHC launch-bundle detection (same_block) + how much the cohort still holds; include_balances adds balanceOf now." },
+  { name: "rhc_token_bundles", description: "Every coordinated same-block buy cluster on an RHC token, launch AND later, with new wallets, sells since (exit) and optional held_now. PRO+." },
+  { name: "rhc_token_bundle_share", description: "Share of supply all RHC bundle accounts hold right now (balanceOf), null unless every account was read. PRO+." },
+  { name: "rhc_token_kol_trades", description: "Every tracked-KOL trade on one RHC token in one payload, optional current balances. BASIC delayed, PRO+ live." },
   { name: "rhc_token_top_traders", description: "Top traders of an RHC token by REALIZED eth (sell−buy, not PnL) + reputation. PRO+." },
   { name: "rhc_token_early_buyers", description: "First buyers of an RHC token, ranked, with still-holding status. PRO+." },
   { name: "rhc_token_flow", description: "RHC net buy/sell by cohort; net_eth = sell−buy so positive = distributing. PRO+." },
@@ -1327,6 +1417,7 @@ const TOOL_CARDS = [
   { name: "rhc_deployer_leaderboard", description: "RHC deployers ranked by reputation — tier rides runner_rate ($100K) + 24h history." },
   { name: "rhc_deployer_profile", description: "Single RHC deployer profile + 50 most recent tokens." },
   { name: "rhc_deployer_tokens", description: "Paginated RHC deployer launch history with live + peak MC." },
+  { name: "rhc_deployer_activity", description: "RHC developer timeline: launches + dev buys/sells of its own tokens, exact raw amounts, WS-joinable ids. PRO+." },
   { name: "rhc_deployer_history", description: "Deep-paginated RHC deployer deploy history with exact total. PRO+." },
   { name: "rhc_deployer_trajectory", description: "Is an RHC deployer improving or declining — streaks + rolling success curve." },
   { name: "rhc_deployer_best_tokens", description: "Highest peak-MC RHC tokens launched by elite/good deployers in a window." },
